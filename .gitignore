@@ -1,0 +1,21 @@
+# Never commit credentials or recorded data.
+*.cred
+*credentials*
+.env
+*.csv
+*.edf
+*.db
+*.sqlite*
+output/
+recordings/
+
+# Local scratch
+__pycache__/
+*.pyc
+build.log
+setup.log
+*.bak-*
+
+# Personal working logs — kept locally, not shared
+HANDOFF.md
+PROGRESS.md

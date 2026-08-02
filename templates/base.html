@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Sleep{% endblock %} · Muse</title>
+<style>
+:root{
+  --bg:#0f1216; --panel:#161a20; --panel2:#1b2027; --line:#252b34;
+  --fg:#e6e8eb; --muted:#98a2b3; --accent:#5eb0ef;
+  --good:#4ade80; --warn:#fbbf24; --bad:#f87171;
+}
+*,*::before,*::after{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-text-size-adjust:100%;
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+header{
+  display:flex;align-items:center;gap:1.25rem;flex-wrap:wrap;
+  padding:.85rem 1.25rem;border-bottom:1px solid var(--line);background:var(--panel);
+  position:sticky;top:0;z-index:5;
+}
+header h1{font-size:.95rem;margin:0;letter-spacing:.02em;font-weight:600}
+nav{display:flex;gap:1rem;font-size:.85rem}
+nav a.on{color:var(--fg);font-weight:600}
+main{padding:1.25rem;max-width:1500px;margin:0 auto}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1rem 1.1rem;margin-bottom:1rem}
+.panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 .85rem;font-weight:600}
+.num{font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:.7rem}
+.tile{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:.7rem .8rem}
+.tile .lbl{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
+.tile .val{font-size:1.5rem;font-weight:600;margin:.15rem 0;font-variant-numeric:tabular-nums}
+.tile .foot{display:flex;align-items:center;justify-content:space-between;gap:.4rem;min-height:26px}
+.delta{font-size:.76rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+.delta.up{color:var(--good)} .delta.down{color:var(--bad)} .delta.flat{color:var(--muted)}
+.spark-empty{color:var(--muted)}
+
+.badge{display:inline-block;padding:.1rem .5rem;border-radius:99px;font-size:.72rem;font-weight:600;vertical-align:middle}
+.badge.good{background:rgba(74,222,128,.15);color:var(--good)}
+.badge.ear-contact-lost{background:rgba(251,191,36,.15);color:var(--warn)}
+.badge.failed{background:rgba(248,113,113,.15);color:var(--bad)}
+.badge.railed{background:rgba(251,191,36,.15);color:var(--warn)}
+.badge.flat{background:rgba(148,163,184,.15);color:var(--muted)}
+.badge.usable{background:rgba(74,222,128,.12);color:var(--good)}
+
+img.plot{width:100%;height:auto;border-radius:6px;background:#fff;display:block}
+.chart svg.linechart{width:100%;height:auto;display:block}
+text.ax{fill:var(--muted);font-size:11px;font-family:ui-monospace,monospace}
+.legend{display:flex;gap:.9rem;flex-wrap:wrap;margin-top:.35rem;font-size:.76rem;color:var(--muted)}
+.key i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:.35rem;vertical-align:middle}
+
+.stagebar{display:flex;gap:2px;height:10px;border-radius:3px;overflow:hidden;background:var(--line);min-width:90px}
+.stagebar .seg{height:100%;border-radius:2px}
+
+table{width:100%;border-collapse:collapse;font-size:.84rem}
+th,td{text-align:left;padding:.45rem .6rem;white-space:nowrap}
+th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line);font-weight:600}
+th a{color:inherit}
+td{border-bottom:1px solid rgba(37,43,52,.6);font-variant-numeric:tabular-nums}
+tr.failed td{background:rgba(248,113,113,.06)}
+tr:hover td{background:rgba(94,176,239,.06)}
+.scroll{overflow-x:auto}
+
+.grid2{display:grid;grid-template-columns:1fr;gap:1rem}
+@media(min-width:1000px){.grid2{grid-template-columns:1fr 1fr}}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:.3rem 1rem;font-size:.84rem}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-variant-numeric:tabular-nums}
+.empty{color:var(--muted);font-size:.85rem}
+.panel.alert{border-color:var(--bad);background:rgba(248,113,113,.07)}
+.panel.alert li{margin:.15rem 0}
+.chips{display:flex;gap:.4rem;flex-wrap:wrap}
+.chip{background:var(--panel2);border:1px solid var(--line);border-radius:99px;padding:.15rem .6rem;font-size:.78rem;color:var(--muted)}
+.chip.on{color:var(--fg);border-color:var(--accent)}
+.note{color:var(--muted);font-size:.76rem;margin-top:.5rem}
+</style>
+</head><body>
+<header>
+  <h1>MUSE · SLEEP</h1>
+  <nav>
+    <a href="/" class="{{ 'on' if active=='overview' }}">Overview</a>
+    <a href="/nights" class="{{ 'on' if active=='nights' }}">Nights</a>
+  </nav>
+</header>
+<main>{% block body %}{% endblock %}</main>
+</body></html>

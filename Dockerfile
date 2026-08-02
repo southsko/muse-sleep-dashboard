@@ -1,0 +1,62 @@
+# Muse S EEG sleep analysis — everything baked in.
+#
+# Unraid does not persist pip installs across reboots, so this image installs
+# nothing at runtime. yasa's staging classifiers ship inside the wheel
+# (yasa/classifiers/*.joblib, loaded from local disk), so the container also
+# needs no network access to stage a recording.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/mpl \
+    NUMBA_CACHE_DIR=/tmp/numba \
+    INPUT_DIR=/data/recordings \
+    OUTPUT_DIR=/data/output
+
+# libgomp is LightGBM's OpenMP runtime — yasa's classifier will not load
+# without it. tzdata so TZ= actually resolves for the nightly scheduler.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        tzdata \
+        bash \
+        coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install from the lock file when one exists, otherwise resolve from the pins.
+COPY requirements.txt requirements.loc[k] ./
+RUN if [ -s requirements.lock ]; then \
+        echo "installing from requirements.lock" && \
+        pip install --no-cache-dir -r requirements.lock ; \
+    else \
+        echo "no lock file — resolving from requirements.txt" && \
+        pip install --no-cache-dir -r requirements.txt ; \
+    fi
+
+COPY analyze.py report.py db.py charts.py app.py make_synthetic.py smoke_test.py ./
+COPY templates/ ./templates/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Build-time smoke test.
+#
+# This is the most valuable line in the file. yasa's classifiers are LightGBM
+# models pickled against particular lightgbm/scikit-learn/joblib versions, and
+# a mismatched combination fails when the model is *loaded* — which would
+# otherwise happen unattended at 09:00 with nobody watching. Running a real
+# staging pass here means a bad dependency resolution fails `docker build`
+# instead. It also warms the numba JIT cache that yasa's feature extraction
+# depends on.
+RUN set -eux \
+ && mkdir -p /tmp/smoke/in /tmp/smoke/out \
+ && python make_synthetic.py /tmp/smoke/in \
+    `# fixtures are seconds old, so disable the still-being-written guard` \
+ && STABLE_MINUTES=0 python analyze.py /tmp/smoke/in -o /tmp/smoke/out \
+ && python smoke_test.py /tmp/smoke/out \
+ && rm -rf /tmp/smoke
+
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

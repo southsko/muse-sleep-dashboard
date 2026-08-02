@@ -1,0 +1,19 @@
+# Top-level pins only. pip resolves the transitive scientific stack, then the
+# first successful build is frozen in full to requirements.lock (see README),
+# which is what the image actually installs. That keeps rebuilds reproducible
+# without me hand-guessing fifteen interlocking numpy/numba/scipy versions.
+#
+# yasa 0.7.x is required: the 0.6 module-level yasa.sleep_statistics() is gone,
+# and analyze.py uses the Hypnogram.sleep_statistics() method instead.
+yasa==0.7.0
+mne==1.12.1
+# mne 1.12 imports edfio.Bdf, which only exists in newer edfio releases —
+# 0.4.9 fails at EDF export with ImportError. Caught by the build smoke test.
+edfio==0.4.14
+pandas==2.2.3
+matplotlib==3.9.4
+
+# Dashboard. Charts are server-rendered inline SVG — no CDN, no JS build step,
+# so the page works with the LAN offline and nothing is fetched at runtime.
+flask==3.1.0
+waitress==3.0.2

@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% set active = 'nights' %}
+{% block title %}{{ n.night_date }}{% endblock %}
+{% macro stat(label, key, value, unit='') %}
+  <dt>{{ label }}</dt>
+  <dd>
+    {{ value }}
+    {% if deltas.get(key) %}
+      {% set d = deltas[key] %}
+      <span class="delta {{ 'up' if d.delta > 0 else ('down' if d.delta < 0 else 'flat') }}"
+            title="baseline {{ '%.1f'|format(d.base) }} from {{ d.n }} nights">
+        {{ '▲' if d.delta > 0 else '▼' }} {{ '%+.1f'|format(d.delta) }}{{ unit }}
+      </span>
+    {% endif %}
+  </dd>
+{% endmacro %}
+{% block body %}
+
+<div class="panel">
+  <h2>
+    {{ n.night_date or n.source }}
+    <span class="badge {{ n.quality }}">{{ n.quality.replace('-', ' ') }}</span>
+  </h2>
+  <p class="note mono">{{ n.source }}</p>
+  {% if n.reason %}<p class="empty">Not scored: {{ n.reason }}</p>{% endif %}
+
+  <div class="chips">
+    {% if prev %}<a class="chip" href="/night/{{ prev.source }}">← previous</a>{% endif %}
+    {% if next %}<a class="chip" href="/night/{{ next.source }}">next →</a>{% endif %}
+    {% if assets.edf %}<a class="chip" href="/asset/{{ n.asset_dir }}/{{ assets.edf }}">EDF</a>{% endif %}
+    <a class="chip" href="/recording/{{ n.source }}">CSV</a>
+  </div>
+</div>
+
+{% if assets.hypnogram %}
+<div class="panel">
+  <h2>Hypnogram</h2>
+  <img class="plot" src="/asset/{{ n.asset_dir }}/{{ assets.hypnogram }}" alt="hypnogram">
+</div>
+{% endif %}
+
+{# Full width, not side-by-side: these are wide time-series rendered at 13in,
+   and halving them makes the axis labels unreadable. #}
+{% if assets.proba %}
+<div class="panel">
+  <h2>Stage probability</h2>
+  <img class="plot" src="/asset/{{ n.asset_dir }}/{{ assets.proba }}" alt="stage probability">
+</div>
+{% endif %}
+{% if assets.bandpower %}
+<div class="panel">
+  <h2>Band power</h2>
+  <img class="plot" src="/asset/{{ n.asset_dir }}/{{ assets.bandpower }}" alt="band power">
+</div>
+{% endif %}
+
+<div class="grid2">
+  <div class="panel">
+    <h2>Sleep statistics</h2>
+    {% if n.TST is not none %}
+    <dl class="kv">
+      {{ stat('Time asleep (TST)', 'TST', n.TST|dur, ' min') }}
+      {{ stat('Efficiency (of worn)', 'SE_worn', '%.1f%%'|format(n.SE_worn) if n.SE_worn is not none else '—', '%') }}
+      <dt>Efficiency (of recording)</dt><dd>{{ '%.1f%%'|format(n.SE_recording) if n.SE_recording is not none else '—' }}</dd>
+      <dt>Maintenance (SME)</dt><dd>{{ '%.1f%%'|format(n.SME) if n.SME is not none else '—' }}</dd>
+      {{ stat('Onset latency', 'SOL', '%.0f min'|format(n.SOL) if n.SOL is not none else '—', ' min') }}
+      <dt>REM latency</dt><dd>{{ '%.0f min'|format(n.Lat_REM) if n.Lat_REM is not none else '—' }}</dd>
+      {{ stat('WASO', 'WASO', '%.0f min'|format(n.WASO) if n.WASO is not none else '—', ' min') }}
+      {{ stat('Awakenings', 'awakenings', n.awakenings if n.awakenings is not none else '—') }}
+      <dt>Fragmentation (SFI)</dt><dd>{{ '%.2f'|format(n.SFI) if n.SFI is not none else '—' }}</dd>
+      <dt>Sleep period (SPT)</dt><dd>{{ n.SPT|dur }}</dd>
+    </dl>
+    <div style="margin-top:.9rem">{{ stage_bar(n, labelled=True)|safe }}</div>
+    <dl class="kv" style="margin-top:.7rem">
+      {{ stat('REM', 'pct_REM', '%.1f%% (%s)'|format(n.pct_REM, n.REM|dur) if n.pct_REM is not none else '—', '%') }}
+      {{ stat('N3 deep', 'pct_N3', '%.1f%% (%s)'|format(n.pct_N3, n.N3|dur) if n.pct_N3 is not none else '—', '%') }}
+      {% if n.pct_N3 is not none and n.pct_N3 < 2 %}
+      <dt></dt><dd class="note" style="margin:0">
+        Near-zero N3 is expected on this hardware, not necessarily a finding —
+        see the note below.</dd>
+      {% endif %}
+      <dt>N2</dt><dd>{{ '%.1f%% (%s)'|format(n.pct_N2, n.N2|dur) if n.pct_N2 is not none else '—' }}</dd>
+      <dt>N1</dt><dd>{{ '%.1f%% (%s)'|format(n.pct_N1, n.N1|dur) if n.pct_N1 is not none else '—' }}</dd>
+      <dt>Wake</dt><dd>{{ n.WAKE|dur }}</dd>
+    </dl>
+    <p class="note">
+      <strong>N3 is not reliably measurable with this headband.</strong> Deep
+      sleep is scored from slow waves above ~75&nbsp;µV, but the Muse references
+      its frontal electrodes to FPz only a few centimetres away, so the measured
+      amplitude is a fraction of a clinical montage (which spans electrode to
+      mastoid). Verified on real data: yasa's slow-wave detector found 9 waves
+      meeting clinical criteria in a 60-minute stretch, where genuine N3 would
+      show thousands. Treat N3 near zero as a limitation of the sensor, not as
+      an absence of deep sleep. TST and efficiency are correspondingly
+      under-estimates.
+    </p>
+    {% else %}
+    <p class="empty">No staging for this recording.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Recording &amp; signal quality</h2>
+    <dl class="kv">
+      <dt>Recording start</dt><dd>{{ n.wear_start_time|clock }}</dd>
+      <dt>Asleep</dt><dd>{{ n.sleep_onset_time|clock }} → {{ n.final_wake_time|clock }}</dd>
+      <dt>Duration recorded</dt><dd>{{ n.duration_minutes|dur }}</dd>
+      <dt>Headband worn</dt><dd>{{ n.wear_minutes|dur }}{% if n.wear_start_min %}
+        <span style="color:var(--muted)">(from +{{ '%.0f'|format(n.wear_start_min) }} min)</span>{% endif %}</dd>
+      {% if n.n_segments and n.n_segments > 1 %}
+      <dt>Segments</dt><dd>{{ n.n_segments }} files
+        <span style="color:var(--muted)">({{ '%.0f'|format(n.gap_minutes or 0) }} min
+        unscored between them)</span></dd>
+      {% endif %}
+      <dt>Staged on</dt><dd><span class="mono">{{ n.staging_channel or '—' }}</span>{% if n.staging_channel %} <span style="color:var(--muted)">({{ n.staging_channel|chlabel }})</span>{% endif %}</dd>
+      <dt>Sample rate</dt><dd>{{ '%.1f Hz'|format(n.sfreq_measured) if n.sfreq_measured else '—' }}</dd>
+      <dt>Analyzed</dt><dd>{{ n.analyzed_at }}</dd>
+    </dl>
+
+    <h2 style="margin-top:1rem">Electrodes</h2>
+    <div class="scroll"><table>
+      <tr><th>Channel</th><th>Position</th><th>Verdict</th><th>Railed</th><th>Std (µV)</th></tr>
+      {% for c in channels %}
+      <tr>
+        <td class="mono">{{ c.name }}</td>
+        <td style="color:var(--muted)">{{ c.name|chlabel }}</td>
+        <td><span class="badge {{ c.verdict }}">{{ c.verdict }}</span></td>
+        <td>{{ '%.1f%%'|format(c.railed_fraction * 100) }}</td>
+        <td>{{ '%.1f'|format(c.std_uv) }}</td>
+      </tr>
+      {% endfor %}
+    </table></div>
+    <p class="note">Quality is measured over the worn window only, so time on the
+    nightstand does not count against an electrode.</p>
+  </div>
+</div>
+{% endblock %}

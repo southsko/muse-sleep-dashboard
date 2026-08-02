@@ -1,0 +1,54 @@
+services:
+  muse-analysis:
+    build: .
+    image: muse-analysis:latest
+    container_name: muse-analysis
+    restart: unless-stopped
+
+    environment:
+      # once | cron | watch
+      MODE: cron
+      # Local time of the nightly batch. TZ below decides what "09:00" means.
+      RUN_AT: "09:00"
+      # Also run immediately on container start, so a restart isn't a lost day.
+      RUN_ON_START: "1"
+      # Decides both the nightly run time and which calendar night a recording
+      # is filed under. Set this to your own timezone (e.g. America/New_York);
+      # ideally the same zone the Pi uses so recording filenames line up.
+      TZ: Etc/UTC
+      INPUT_DIR: /remotes/muse_recordings
+      OUTPUT_DIR: /data/output
+      # Dashboard runs alongside the scheduler in this same container.
+      SERVE_WEB: "1"
+      WEB_PORT: "842"
+
+    ports:
+      - "842:842"
+
+    volumes:
+      # Source recordings, READ-ONLY. Today this is the Pi's Samba share; when
+      # the Pi starts rsync-pushing instead, only `source` changes.
+      #
+      # Mounted under /mnt/remotes (Unraid's convention for remote shares), not
+      # /mnt/user, which is a FUSE (shfs) layer that masks nested mounts.
+      #
+      # propagation: rslave is essential. A plain bind attaches the directory
+      # inode as it was at container start: if the CIFS mount lands afterwards
+      # (very likely at boot, where the mount waits for the array) the container
+      # never sees it, and if the mount later drops the container keeps serving
+      # a stale view — both silent. rslave lets host mount/unmount events through.
+      # Requires the host mountpoint to be shared: mount --make-rshared /mnt/remotes
+      # Bind the PARENT directory, not the share itself. Binding the share
+      # directly captures that mount's inode: the container then keeps its own
+      # reference, so a host unmount leaves it serving a stale view forever, and
+      # a mount that lands after container start is never seen. Binding the
+      # parent with rslave means mount/unmount events *inside* it propagate
+      # through, which is what actually happens at boot and on a Pi reboot.
+      - type: bind
+        source: /mnt/remotes
+        target: /remotes
+        read_only: true
+        bind:
+          propagation: rslave
+      # Results live on the server, never written back to the Pi's SD card.
+      - /mnt/user/data/eeg/output:/data/output

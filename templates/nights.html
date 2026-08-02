@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% set active = 'nights' %}
+{% block title %}Nights{% endblock %}
+{% macro sortlink(key, label) %}
+  {% set nd = 'asc' if (sort == key and dir == 'desc') else 'desc' %}
+  <a href="/nights?sort={{ key }}&dir={{ nd }}{{ '&hide_failed=1' if hide_failed }}">
+    {{ label }}{% if sort == key %} {{ '▾' if dir == 'desc' else '▴' }}{% endif %}
+  </a>
+{% endmacro %}
+{% block body %}
+
+<div class="panel">
+  <h2>All nights &middot; {{ nights|length }}</h2>
+  <div class="chips" style="margin-bottom:.8rem">
+    <a class="chip {{ 'on' if not hide_failed }}" href="/nights?sort={{ sort }}&dir={{ dir }}">All</a>
+    <a class="chip {{ 'on' if hide_failed }}" href="/nights?sort={{ sort }}&dir={{ dir }}&hide_failed=1">Hide failed</a>
+  </div>
+
+  {% if not nights %}
+    <p class="empty">Nothing analyzed yet.</p>
+  {% else %}
+  <div class="scroll">
+  <table>
+    <tr>
+      <th>{{ sortlink('night_date', 'Night') }}</th>
+      <th>Quality</th>
+      <th>{{ sortlink('TST', 'Asleep') }}</th>
+      <th>{{ sortlink('SE_worn', 'Eff') }}</th>
+      <th>{{ sortlink('pct_REM', 'REM') }}</th>
+      <th>{{ sortlink('pct_N3', 'N3') }}</th>
+      <th>{{ sortlink('awakenings', 'Wakes') }}</th>
+      <th>Composition</th>
+      <th>Worn</th>
+      <th>Seg</th>
+      <th>Ch</th>
+    </tr>
+    {% for n in nights %}
+    <tr class="{{ 'failed' if n.status != 'ok' }}">
+      <td><a href="/night/{{ n.source }}">{{ n.night_date or '—' }}</a>
+          <span class="mono" style="color:var(--muted);font-size:.75rem">
+            {{ n.sleep_onset_time|clock }}</span></td>
+      <td><span class="badge {{ n.quality }}">{{ n.quality.replace('-', ' ') }}</span></td>
+      <td>{{ n.TST|dur }}</td>
+      <td>{{ '%.0f%%'|format(n.SE_worn) if n.SE_worn is not none else '—' }}</td>
+      <td>{{ '%.0f%%'|format(n.pct_REM) if n.pct_REM is not none else '—' }}</td>
+      <td>{{ '%.0f%%'|format(n.pct_N3) if n.pct_N3 is not none else '—' }}</td>
+      <td>{{ n.awakenings if n.awakenings is not none else '—' }}</td>
+      <td style="width:130px">{{ stage_bar(n)|safe }}</td>
+      <td>{{ n.wear_minutes|dur }}</td>
+      <td>{{ n.n_segments if n.n_segments and n.n_segments > 1 else "—" }}</td>
+      <td class="mono" style="font-size:.78rem">{{ n.staging_channel or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="note">Failed nights are shown, not hidden — a sensor problem is not a sleep result.</p>
+  {% endif %}
+</div>
+{% endblock %}

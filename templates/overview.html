@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% set active = 'overview' %}
+{% block title %}Overview{% endblock %}
+{% block body %}
+
+{% if health and health.problems %}
+<div class="panel alert">
+  <h2 style="color:var(--bad)">⚠ Data pipeline problem</h2>
+  <ul style="margin:.2rem 0 .6rem 1.1rem;padding:0">
+    {% for p in health.problems %}<li>{{ p }}</li>{% endfor %}
+  </ul>
+  <p class="note" style="margin:0">
+    Recordings folder: <span class="mono">{{ health.input_dir }}</span>
+    &middot; visible: {{ 'yes' if health.input_visible else 'NO' }}
+    &middot; files: {{ health.input_files }}
+    {% if health.last_night %}&middot; newest night: {{ health.last_night }}{% endif %}
+  </p>
+</div>
+{% endif %}
+
+{% if not latest_raw %}
+  <div class="panel">
+    <h2>No data</h2>
+    <p class="empty">No recordings have been analyzed yet. Drop a muselsl CSV into
+    the recordings folder and the worker will pick it up on its next run.</p>
+  </div>
+{% else %}
+
+<div class="panel">
+  <h2>
+    Last night
+    {% if latest %}
+      &middot; {{ latest.night_date }}
+      <span class="badge {{ latest.quality }}">{{ latest.quality.replace('-', ' ') }}</span>
+    {% else %}
+      <span class="badge failed">no scoreable night</span>
+    {% endif %}
+  </h2>
+
+  {% if latest %}
+    <div class="tiles">
+      {% for t in tiles %}
+      <div class="tile">
+        <div class="lbl">{{ t.label }}</div>
+        <div class="val">{{ t.value }}</div>
+        <div class="foot">
+          {% if t.delta_txt and t.n_baseline >= 3 %}
+            <span class="delta {{ 'up' if t.delta > 0 else ('down' if t.delta < 0 else 'flat') }}"
+                  title="vs median of last {{ t.n_baseline }} nights">
+              {{ '▲' if t.delta > 0 else ('▼' if t.delta < 0 else '') }} {{ t.delta_txt }}
+            </span>
+          {% else %}
+            <span class="delta flat" title="need at least 3 prior nights">no baseline</span>
+          {% endif %}
+          {{ t.spark|safe }}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div style="margin-top:1rem">
+      {% set a = latest.assets_json|from_json if false else None %}
+      <img class="plot" src="/asset/{{ latest.asset_dir }}/{{ latest.source.rsplit('.',1)[0] }}_hypnogram.png"
+           alt="hypnogram" loading="lazy">
+    </div>
+    <p class="note">
+      Asleep {{ latest.sleep_onset_time|clock }} → {{ latest.final_wake_time|clock }}
+      &middot; worn {{ latest.wear_minutes|dur }} of {{ latest.duration_minutes|dur }} recorded
+      &middot; staged on {{ latest.staging_channel }}
+      &middot; <a href="/night/{{ latest.source }}">detail →</a>
+    </p>
+  {% else %}
+    <p class="empty">
+      The most recent recording ({{ latest_raw.source }}) could not be scored:
+      {{ latest_raw.reason or 'unknown reason' }}.
+      <a href="/night/{{ latest_raw.source }}">See detail →</a>
+    </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Trends</h2>
+  <div class="chips">
+    {% for w in ['7','30','90','all'] %}
+      <a class="chip {{ 'on' if window==w }}" href="/?window={{ w }}">{{ w }}</a>
+    {% endfor %}
+    <span class="chip" style="border-style:dashed">n = {{ trends.n }}</span>
+  </div>
+
+  {% if trends.n < 3 %}
+    <p class="note">Only {{ trends.n }} scored night{{ '' if trends.n == 1 else 's' }}
+    so far — too few to read a trend. Charts fill in as nights accumulate.</p>
+  {% endif %}
+
+  <div style="margin-top:.9rem">
+    <h2>Time asleep (min)</h2>{{ trends.tst|safe }}
+  </div>
+  <div style="margin-top:1rem">
+    <h2>Sleep efficiency (%, of time worn)</h2>{{ trends.eff|safe }}
+  </div>
+  <div style="margin-top:1rem">
+    <h2>Stage composition (%)</h2>{{ trends.stages|safe }}
+  </div>
+</div>
+
+<p class="note">
+  {{ n_scored }} of {{ n_total }} recordings scored.
+  Efficiency is time asleep divided by time the headband was actually worn —
+  not a clinical time-in-bed figure.
+</p>
+{% endif %}
+{% endblock %}
