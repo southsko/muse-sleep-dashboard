@@ -9,13 +9,14 @@ LAN-only, single user, no auth — per the brief.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import statistics
 from datetime import datetime
 from pathlib import Path
 
-from flask import (Flask, abort, render_template, request,
+from flask import (Flask, abort, redirect, render_template, request,
                    send_from_directory)
 
 import charts
@@ -26,8 +27,62 @@ DB_PATH = OUTPUT_DIR / "sleep.db"
 BASELINE_NIGHTS = 30      # trailing window for personal baselines
 SPARK_NIGHTS = 14
 
+# --- user display settings (timezone override + clock format) ---------------
+SETTINGS_PATH = OUTPUT_DIR / "ui_settings.json"
+DEFAULT_SETTINGS = {"timezone": "auto", "time_format": "24"}
+# Curated dropdown; "auto" uses the offset detected from each recording.
+COMMON_ZONES = [
+    "UTC", "America/Los_Angeles", "America/Denver", "America/Phoenix",
+    "America/Chicago", "America/New_York", "America/Anchorage",
+    "America/Halifax", "America/Sao_Paulo", "Europe/London", "Europe/Paris",
+    "Europe/Berlin", "Europe/Moscow", "Asia/Kolkata", "Asia/Shanghai",
+    "Asia/Tokyo", "Australia/Sydney", "Pacific/Auckland",
+]
+
+
+def load_settings() -> dict:
+    try:
+        return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(form) -> None:
+    tz = form.get("timezone", "auto")
+    fmt = "12" if form.get("time_format") == "12" else "24"
+    if tz != "auto" and tz not in COMMON_ZONES:
+        tz = "auto"
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps({"timezone": tz, "time_format": fmt}))
+
+
+def clock(iso) -> str:
+    """Render a stored ISO time honouring the user's timezone + format settings.
+
+    Stored times are timezone-aware (the offset auto-detected from the recording
+    filenames). 'auto' displays them as-is; a chosen IANA zone reconverts the
+    same instant. Format is 24h or 12h per the setting.
+    """
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return "—"
+    s = load_settings()
+    if s["timezone"] != "auto" and dt.tzinfo is not None:
+        try:
+            from zoneinfo import ZoneInfo
+            dt = dt.astimezone(ZoneInfo(s["timezone"]))
+        except Exception:
+            pass
+    if s["time_format"] == "12":
+        return dt.strftime("%-I:%M %p") if os.name != "nt" else dt.strftime("%I:%M %p")
+    return dt.strftime("%H:%M")
+
+
 app = Flask(__name__)
-app.jinja_env.filters["clock"] = charts.fmt_clock
+app.jinja_env.filters["clock"] = clock
 app.jinja_env.filters["dur"] = charts.fmt_dur
 app.jinja_env.filters["chlabel"] = charts.channel_label
 
@@ -257,6 +312,30 @@ def recording(filename):
     if not src.is_dir():
         abort(404)
     return send_from_directory(src, filename, as_attachment=True)
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    if request.method == "POST":
+        save_settings(request.form)
+        return redirect("/settings")
+    # Show the offset auto-detected from the data, for reference.
+    detected = None
+    for r in rows():
+        iso = r["sleep_onset_time"] or r["wear_start_time"] or r["start_time"]
+        if not iso:
+            continue
+        try:
+            off = datetime.fromisoformat(iso).utcoffset()
+        except (ValueError, TypeError):
+            off = None
+        if off is not None:
+            mins = int(off.total_seconds() // 60)
+            detected = f"UTC{'+' if mins >= 0 else '-'}{abs(mins)//60:02d}:{abs(mins)%60:02d}"
+            break
+    return render_template("settings.html", active="settings",
+                           settings=load_settings(), zones=COMMON_ZONES,
+                           detected=detected)
 
 
 @app.route("/healthz")

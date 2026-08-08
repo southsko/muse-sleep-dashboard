@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% set active = 'settings' %}
+{% block title %}Settings{% endblock %}
+{% block body %}
+
+<style>
+  form.settings label.row{display:block;margin:0 0 1.4rem}
+  form.settings .lbl{display:block;color:var(--fg);font-weight:600;margin-bottom:.35rem}
+  form.settings .hint{color:var(--muted);font-size:.78rem;margin:.3rem 0 0}
+  form.settings select{
+    background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:.45rem .6rem;font-size:.9rem;min-width:16rem;max-width:100%;
+  }
+  form.settings .radios{display:flex;gap:1.2rem;margin-top:.15rem}
+  form.settings .radios label{display:flex;align-items:center;gap:.4rem;color:var(--fg);font-weight:400}
+  form.settings button{
+    background:var(--accent);color:#0b1016;border:none;border-radius:6px;
+    padding:.5rem 1.1rem;font-size:.9rem;font-weight:600;cursor:pointer;
+  }
+  form.settings button:hover{filter:brightness(1.08)}
+</style>
+
+<div class="panel">
+  <h2>Display settings</h2>
+  <form class="settings" method="post" action="/settings">
+
+    <label class="row">
+      <span class="lbl">Time zone</span>
+      <select name="timezone">
+        <option value="auto" {{ 'selected' if settings.timezone == 'auto' }}>
+          Auto — detect from each recording{% if detected %} (currently {{ detected }}){% endif %}
+        </option>
+        {% for z in zones %}
+        <option value="{{ z }}" {{ 'selected' if settings.timezone == z }}>{{ z.replace('_', ' ') }}</option>
+        {% endfor %}
+      </select>
+      <p class="hint">Auto reads the offset straight from the recordings, so it follows
+        daylight saving on its own. Pick a zone only to override it.</p>
+    </label>
+
+    <label class="row">
+      <span class="lbl">Clock format</span>
+      <span class="radios">
+        <label><input type="radio" name="time_format" value="24"
+               {{ 'checked' if settings.time_format != '12' }}> 24-hour (21:30)</label>
+        <label><input type="radio" name="time_format" value="12"
+               {{ 'checked' if settings.time_format == '12' }}> 12-hour (9:30 PM)</label>
+      </span>
+    </label>
+
+    <button type="submit">Save</button>
+  </form>
+  <p class="note">Applies to clock times shown across the dashboard. The hypnogram plots
+    keep the recording's own local time on their axis.</p>
+</div>
+{% endblock %}
