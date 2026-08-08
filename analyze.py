@@ -433,8 +433,28 @@ def _stage_bouts(stages: list[str]):
     return out
 
 
+def _clock_prefs() -> tuple[str, str]:
+    """Read the dashboard's timezone/format prefs so baked plots match the UI.
+
+    The plot images are the one place the web layer can't reformat after the
+    fact — the axis is drawn here, once. Reading the same ui_settings.json the
+    dashboard writes keeps the hypnogram axis in step with the tables (12/24h,
+    and any timezone override). Absent/unreadable → the neutral default.
+    """
+    for base in (os.environ.get("OUTPUT_DIR"), "/data/output"):
+        if not base:
+            continue
+        try:
+            s = json.loads((Path(base) / "ui_settings.json").read_text())
+            return s.get("timezone", "auto"), s.get("time_format", "24")
+        except Exception:
+            continue
+    return "auto", "24"
+
+
 def plot_hypnogram(hypno, out_path: Path, title: str,
-                   start_dt: datetime | None = None) -> None:
+                   start_dt: datetime | None = None,
+                   clock_fmt: str = "24") -> None:
     """Draw the night as coloured bouts on stage rows.
 
     yasa's default plot is a bare line, which makes it hard to see at a glance
@@ -486,10 +506,15 @@ def plot_hypnogram(hypno, out_path: Path, title: str,
     if start_dt is not None:
         step = max(1, int(round(n / 8)))
         ticks = list(range(0, n, step))
+        twelve = clock_fmt == "12"
+        tick_fmt = "%I:%M %p" if twelve else "%H:%M"
+
+        def _lbl(t):
+            s = (start_dt + timedelta(seconds=t * EPOCH_SEC)).strftime(tick_fmt)
+            return s[1:] if twelve and s.startswith("0") else s   # 09:16 PM -> 9:16 PM
+
         ax.set_xticks(ticks)
-        ax.set_xticklabels(
-            [(start_dt + timedelta(seconds=t * EPOCH_SEC)).strftime("%H:%M")
-             for t in ticks], fontsize=9)
+        ax.set_xticklabels([_lbl(t) for t in ticks], fontsize=9)
     else:
         ax.set_xlabel("Epoch (30 s)", fontsize=9)
 
@@ -1001,13 +1026,32 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
             local_start + timedelta(seconds=(sleep_idx[-1] + 1) * EPOCH_SEC)
         ).isoformat(timespec="seconds")
 
+    # The hypnogram axis is baked in here, so it must match the dashboard's own
+    # timezone/format settings (the web layer can reformat table times per request
+    # but not a PNG). Stored ISO times stay in the DETECTED zone — the web layer
+    # converts those — but the plot honours a timezone override directly, so the
+    # two never disagree.
+    pref_tz, pref_fmt = _clock_prefs()
+    plot_start = local_start
+    if pref_tz != "auto":
+        try:
+            from zoneinfo import ZoneInfo
+            plot_start = t0.astimezone(ZoneInfo(pref_tz))
+        except Exception:
+            pass
+
+    # Title the plots with the derivation actually staged on (res.staging_channel,
+    # e.g. "AF7-TP10+AF8-TP9"), NOT the single-channel pick `ch` — staging is the
+    # bipolar ensemble, and labelling it "staged on AF7" misrepresents the montage.
     suffix = f" ({len(paths)} segments)" if len(paths) > 1 else ""
-    plot_hypnogram(hypno, hypno_png, f"{name} — staged on {ch}{suffix}",
-                   start_dt=local_start)
+    plot_hypnogram(hypno, hypno_png,
+                   f"{name} — staged on {res.staging_channel}{suffix}",
+                   start_dt=plot_start, clock_fmt=pref_fmt)
     res.outputs["hypnogram"] = hypno_png.name
 
     if proba is not None and not proba.empty:
-        plot_proba(proba, proba_png, f"{name} — stage probability ({ch})")
+        plot_proba(proba, proba_png,
+                   f"{name} — stage probability ({res.staging_channel})")
         res.outputs["proba"] = proba_png.name
 
     try:

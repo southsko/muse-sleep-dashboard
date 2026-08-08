@@ -47,13 +47,31 @@ def load_settings() -> dict:
         return dict(DEFAULT_SETTINGS)
 
 
-def save_settings(form) -> None:
+def save_settings(form) -> bool:
+    """Persist settings; return True if the plot-affecting prefs changed."""
     tz = form.get("timezone", "auto")
     fmt = "12" if form.get("time_format") == "12" else "24"
     if tz != "auto" and tz not in COMMON_ZONES:
         tz = "auto"
+    before = load_settings()
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(json.dumps({"timezone": tz, "time_format": fmt}))
+    return (before.get("timezone"), before.get("time_format")) != (tz, fmt)
+
+
+def regenerate_plots() -> None:
+    """Rebake the hypnogram plots so their (baked-in) time axis matches the new
+    settings. The axis is drawn at analysis time and can't be reformatted per
+    request like table times, so a settings change means re-running the analyzer
+    with --force. Backgrounded and flock-guarded (analyze.py serializes itself),
+    so a rapid series of saves can't pile up overlapping runs."""
+    import subprocess
+    in_dir = os.environ.get("INPUT_DIR", "/data/recordings")
+    subprocess.Popen(
+        ["python", "/app/analyze.py", in_dir, "-o", str(OUTPUT_DIR),
+         "--force", "--no-index"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 def clock(iso) -> str:
@@ -317,8 +335,9 @@ def recording(filename):
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     if request.method == "POST":
-        save_settings(request.form)
-        return redirect("/settings")
+        if save_settings(request.form):
+            regenerate_plots()   # rebake plot axes to match the new prefs
+        return redirect("/settings?saved=1")
     # Show the offset auto-detected from the data, for reference.
     detected = None
     for r in rows():
@@ -335,7 +354,7 @@ def settings():
             break
     return render_template("settings.html", active="settings",
                            settings=load_settings(), zones=COMMON_ZONES,
-                           detected=detected)
+                           detected=detected, saved=request.args.get("saved"))
 
 
 @app.route("/healthz")

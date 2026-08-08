@@ -22,6 +22,11 @@
 
 <div class="panel">
   <h2>Display settings</h2>
+  {% if saved %}
+  <p class="note" style="color:var(--good);margin-top:0;margin-bottom:.9rem">
+    Saved. Hypnogram plots are re-rendering in the background to match — give it
+    a minute, then refresh a night.</p>
+  {% endif %}
   <form class="settings" method="post" action="/settings">
 
     <label class="row">
