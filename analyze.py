@@ -732,7 +732,23 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     if len(paths) > 1:
         log.info("  night spans %d segments", len(paths))
 
-    segs = [prepare_segment(p, out_dir) for p in paths]
+    # One unreadable segment must not sink the whole night. A file still being
+    # written, truncated, or clobbered by an overlapping run used to raise and
+    # error the entire night (FileNotFoundError on its EDF, seen 2026-08-08).
+    # Skip the bad one and score from the rest.
+    segs = []
+    for p in paths:
+        try:
+            segs.append(prepare_segment(p, out_dir))
+        except Exception as exc:
+            log.error("  %s: segment unreadable, skipping (%s: %s)",
+                      p.name, type(exc).__name__, exc)
+    if not segs:
+        res.status = "error"
+        res.reason = "every segment failed to load"
+        log.error("  %s: %s", name, res.reason)
+        _write_stats(res, stats_json, stats_txt)
+        return res
 
     res.duration_minutes = round(sum(s.duration_minutes for s in segs), 2)
     res.sfreq_measured = next((s.sfreq_measured for s in segs if s.sfreq_measured), None)
@@ -1095,6 +1111,22 @@ def main(argv=None) -> int:
     if not in_path.exists():
         log.error("input path does not exist: %s", in_path)
         return 2
+
+    # Serialize every run. The scheduled batch, the run-on-start, and a manual
+    # `docker exec ... analyze.py` all share one .work directory; overlapping
+    # runs prune each other's temp files mid-write and error a whole night
+    # (FileNotFoundError on a segment EDF, 2026-08-08). A non-blocking flock
+    # makes a second run exit cleanly rather than collide — the next scan, at
+    # most a few hours later, does the work.
+    import fcntl
+    out_root.mkdir(parents=True, exist_ok=True)
+    lock_path = out_root / ".batch.lock"
+    lock_fh = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("another analyze run holds the lock — exiting without doing work")
+        return 0
 
     started = datetime.now()
 

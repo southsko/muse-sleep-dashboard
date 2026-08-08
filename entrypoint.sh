@@ -21,7 +21,9 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [entrypoint] $*"; }
 
 run_batch() {
   log "starting batch over ${INPUT_DIR}"
-  # Never let one bad batch kill the container in cron/watch mode.
+  # analyze.py serializes itself with a lock (a scheduled run, a startup run and
+  # a manual invocation share one .work dir and must not overlap), so we simply
+  # never let one bad batch kill the container in cron/watch mode.
   if python /app/analyze.py "${INPUT_DIR}" -o "${OUTPUT_DIR}" "$@"; then
     log "batch complete"
   else

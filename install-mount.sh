@@ -106,6 +106,26 @@ GO_EOF
     echo "    appended (previous version backed up alongside)"
 fi
 
+echo "==> installing stale-mount watchdog"
+WATCHDOG_SRC="$(dirname "$(readlink -f "$0")")/mount-watchdog.sh"
+if [[ -f "${WATCHDOG_SRC}" ]]; then
+    cp "${WATCHDOG_SRC}" /boot/config/mount-watchdog.sh
+    chmod +x /boot/config/mount-watchdog.sh 2>/dev/null || true
+    if ! grep -q "mount-watchdog" "${GO}"; then
+        cat >> "${GO}" <<'GO_EOF'
+
+# Self-heal the recordings mount when it goes stale (backgrounded loop).
+bash /boot/config/mount-watchdog.sh &
+GO_EOF
+    fi
+    # (Re)start it now.
+    pkill -f mount-watchdog.sh 2>/dev/null || true
+    setsid bash /boot/config/mount-watchdog.sh >/dev/null 2>&1 < /dev/null &
+    echo "    watchdog installed and running"
+else
+    echo "    mount-watchdog.sh not found beside this script — skipping" >&2
+fi
+
 echo "==> mounting now"
 bash "${HELPER}"
 if mountpoint -q "${MOUNTPOINT}"; then
