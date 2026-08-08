@@ -152,7 +152,9 @@ def upsert_night(conn: sqlite3.Connection, result: dict, asset_dir: str) -> None
 
     row: dict = {
         "source": result.get("source"),
-        "night_date": night_date(result.get("start_time")),
+        # Prefer the analyzer's night_date (computed from the recording's own
+        # local time); fall back to deriving it from the UTC start_time.
+        "night_date": result.get("night_date") or night_date(result.get("start_time")),
         "schema_version": result.get("schema_version"),
         "analyzed_at": result.get("analyzed_at"),
         "status": result.get("status"),

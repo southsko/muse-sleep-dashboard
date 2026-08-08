@@ -50,7 +50,7 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 6   # v6: bipolar staging on concatenated real signal
+SCHEMA_VERSION = 7   # v7: auto-detect recorder timezone from filenames
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -117,6 +117,7 @@ class Result:
     source: str = ""
     status: str = "ok"                  # "ok" | "bad" | "error"
     reason: str = ""
+    night_date: str | None = None       # local 'night of' date, YYYY-MM-DD
     start_time: str | None = None
     duration_minutes: float = 0.0
     # The subset of the recording during which the band was actually worn;
@@ -144,6 +145,58 @@ class Result:
 # --------------------------------------------------------------------------
 # Loading
 # --------------------------------------------------------------------------
+
+def _night_date(local_dt: datetime) -> str:
+    """The date a night is filed under, in local time.
+
+    A session starting after noon belongs to that date; before noon it belongs
+    to the previous date, so a 23:30->07:00 sleep is one night, not two.
+    """
+    d = local_dt
+    if d.hour < 12:
+        d = d - timedelta(days=1)
+    return d.date().isoformat()
+
+
+def _night_date_from_name(stem: str) -> str | None:
+    """Night date straight from the recording filename (already local time)."""
+    import re
+    m = re.search(r"(\d{8})_(\d{6})", stem)
+    if not m:
+        return None
+    try:
+        return _night_date(datetime.strptime(m.group(1) + m.group(2),
+                                             "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
+
+
+def detect_local_tz(stem: str, first_utc: datetime | None) -> timezone | None:
+    """Infer the recorder's local UTC offset from a filename vs its UTC data.
+
+    Recording filenames are `overnight_YYYYMMDD_HHMMSS` in the RECORDER's local
+    wall-clock time, while the first sample's timestamp is UTC epoch. Their
+    difference is the local offset — detected per recording, so it is correct
+    across DST and needs no timezone configured anywhere (which also keeps a
+    location out of the committed code).
+    """
+    import re
+    m = re.search(r"(\d{8})_(\d{6})", stem)
+    if not m or first_utc is None:
+        return None
+    try:
+        local = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    delta = local - first_utc.replace(tzinfo=None)
+    # Round to the nearest 15 min — covers every real-world offset, including
+    # the half-hour and 45-min zones, and absorbs the seconds of clock skew
+    # between "muselsl started" (filename) and the first sample's timestamp.
+    quarters = round(delta.total_seconds() / 900)
+    if abs(quarters) > 56:               # > ±14 h is not a real timezone
+        return None
+    return timezone(timedelta(minutes=quarters * 15))
+
 
 def load_csv(path: Path) -> tuple[pd.DataFrame, datetime | None, float | None]:
     """Read a muselsl CSV and return (eeg_uv, start_datetime, measured_sfreq)."""
@@ -561,6 +614,7 @@ class Segment:
     start_utc: datetime | None = None        # start of the WORN window, UTC
     wear_minutes: float | None = None
     wear_start_min: float | None = None
+    tz: timezone | None = None               # local offset inferred from filename
     # The worn stretch of signal, in microvolts. Staging happens once over the
     # whole assembled night, not here.
     eeg: pd.DataFrame | None = None
@@ -612,6 +666,7 @@ def prepare_segment(csv_path: Path, out_dir: Path) -> Segment:
     eeg_uv, start_dt, measured = load_csv(csv_path)
     seg.duration_minutes = round(len(eeg_uv) / SFREQ / 60.0, 2)
     seg.sfreq_measured = round(measured, 2) if measured else None
+    seg.tz = detect_local_tz(csv_path.stem, start_dt)
 
     if measured and abs(measured - SFREQ) / SFREQ > 0.02:
         log.warning("  %s: measured %.1f Hz vs assumed %.0f Hz "
@@ -831,6 +886,10 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     if len(paths) > 1:
         log.info("  night spans %d segments", len(paths))
 
+    # Night date comes straight from the filename, which is already in the
+    # recorder's local time — no timezone needed for the date.
+    res.night_date = _night_date_from_name(paths[0].stem)
+
     # One unreadable segment must not sink the whole night. A file still being
     # written, truncated, or clobbered by an overlapping run used to raise and
     # error the entire night (FileNotFoundError on its EDF, seen 2026-08-08).
@@ -915,7 +974,10 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         log.info("  trimmed %.1f min of artifact around %d dropouts",
                  trimmed, int(np.diff(np.asarray(is_gap, int)).clip(min=0).sum()))
 
-    local_start = t0.astimezone()
+    # Display in the recorder's own timezone, inferred from the filenames — not
+    # the analysis container's clock (which is UTC and made every time wrong).
+    display_tz = next((s.tz for s in scored if s.tz), timezone.utc)
+    local_start = t0.astimezone(display_tz)
     hypno = yasa.Hypnogram(stages, n_stages=5, freq="30s",
                            start=local_start.replace(tzinfo=None))
 
