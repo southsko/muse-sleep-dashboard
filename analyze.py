@@ -50,7 +50,7 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 2   # v2: ensemble staging across both frontal probes
+SCHEMA_VERSION = 3   # v3: trim artifact epochs flanking dropouts
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -714,6 +714,21 @@ def assemble_night(segs: list[Segment]) -> tuple[mne.io.RawArray, np.ndarray, da
     return raw, is_gap, t0, round(float(is_gap.sum()) * EPOCH_SEC / 60.0, 2)
 
 
+def _expand_gaps(is_gap, guard: int) -> np.ndarray:
+    """The gap mask, widened by `guard` epochs on each side of every gap.
+
+    Used to trim the artifact-heavy epochs flanking each dropout — see the call
+    site in process_night.
+    """
+    a = np.asarray(is_gap, dtype=bool)
+    if guard <= 0 or not a.any():
+        return a
+    out = a.copy()
+    for i in np.flatnonzero(a):
+        out[max(0, i - guard): i + guard + 1] = True
+    return out
+
+
 def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     """Score one night, which may span several recorded segments."""
     paths = sorted(csv_paths)
@@ -813,14 +828,26 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     log.info("  assembled %.1f min continuous (%.1f min of gaps), staged on %s",
              raw.times[-1] / 60.0, gap_min, res.staging_channel)
 
-    # Zero-filled gaps get labelled by the classifier like any other epoch;
-    # whatever it decides about silence is meaningless, so overwrite as unscored.
-    for i in range(min(len(stages), len(is_gap))):
-        if is_gap[i]:
+    # Mark unscored: the zero-filled gaps themselves, PLUS a guard band of a few
+    # epochs on each side of every gap. When the Bluetooth link dies and later
+    # reconnects, the signal on either side of the gap is artifact-heavy (the
+    # link failing, then the amplifier re-settling), and the classifier reads
+    # that noise as WAKE — inflating time-awake and awakenings on exactly the
+    # dropout-riddled nights this headband produces. Trimming those boundary
+    # epochs stops a flaky link from masquerading as broken sleep.
+    guard = int(os.environ.get("DROPOUT_GUARD_EPOCHS", "2"))   # ~1 min each side
+    unscored = _expand_gaps(is_gap, guard)
+    trimmed = (unscored.sum() - int(np.asarray(is_gap).sum())) * EPOCH_SEC / 60.0
+    for i in range(min(len(stages), len(unscored))):
+        if unscored[i]:
             stages[i] = "UNS"
     if proba is not None and len(proba):
         proba = proba.copy()
-        proba.iloc[[i for i in range(min(len(proba), len(is_gap))) if is_gap[i]]] = np.nan
+        proba.iloc[[i for i in range(min(len(proba), len(unscored)))
+                    if unscored[i]]] = np.nan
+    if trimmed > 0:
+        log.info("  trimmed %.1f min of artifact around %d dropouts",
+                 trimmed, int(np.diff(np.asarray(is_gap, int)).clip(min=0).sum()))
 
     local_start = t0.astimezone()
     hypno = yasa.Hypnogram(stages, n_stages=5, freq="30s",
