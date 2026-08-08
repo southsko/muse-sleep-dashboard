@@ -50,7 +50,7 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # v2: ensemble staging across both frontal probes
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -766,15 +766,12 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         return res
 
     ch = scored[0].staging_channel
-    res.staging_channel = ch
     res.wear_minutes = round(sum(s.wear_minutes or 0 for s in scored), 2)
     res.wear_start_min = scored[0].wear_start_min
 
     raw, is_gap, t0, gap_min = assemble_night(scored)
     res.gap_minutes = gap_min
     res.start_time = t0.isoformat()
-    log.info("  assembled %.1f min continuous (%.1f min of gaps), staging on %s",
-             raw.times[-1] / 60.0, gap_min, ch)
 
     if raw.times[-1] / 60.0 < MIN_STAGING_MINUTES:
         res.status = "bad"
@@ -783,10 +780,38 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         _write_stats(res, stats_json, stats_txt)
         return res
 
-    # ONE staging pass over the whole night — see assemble_night().
-    staged = yasa.SleepStaging(raw, eeg_name=ch).predict()
-    stages = staged.hypno.tolist()
-    proba = staged.proba
+    # Stage on EVERY usable frontal channel and average their per-epoch
+    # probabilities, rather than staging on one and discarding the other. Two
+    # clean forehead electrodes beat one: uncorrelated noise averages down, and
+    # an artifact on one channel in a given epoch is outvoted by the other. Falls
+    # back to a single channel (or a temporal one) when only one is usable.
+    stage_channels = [c["name"] for c in res.channels
+                      if c["name"] in ("AF7", "AF8") and c["verdict"] == "usable"]
+    if not stage_channels:
+        stage_channels = [ch]      # whatever pick_staging_channel settled on
+
+    probas = []
+    used = []
+    for c in stage_channels:
+        try:
+            probas.append(yasa.SleepStaging(raw, eeg_name=c).predict().proba)
+            used.append(c)
+        except Exception as exc:
+            log.warning("  staging on %s failed, skipping: %s", c, exc)
+    if not probas:
+        staged = yasa.SleepStaging(raw, eeg_name=ch).predict()
+        probas, used = [staged.proba], [ch]
+
+    # Ensemble: mean of aligned probabilities (same epochs, same raw), argmax.
+    proba = probas[0].copy()
+    for p in probas[1:]:
+        proba = proba.add(p, fill_value=0)
+    proba = proba / len(probas)
+    stages = proba.idxmax(axis=1).tolist()
+
+    res.staging_channel = "+".join(used)
+    log.info("  assembled %.1f min continuous (%.1f min of gaps), staged on %s",
+             raw.times[-1] / 60.0, gap_min, res.staging_channel)
 
     # Zero-filled gaps get labelled by the classifier like any other epoch;
     # whatever it decides about silence is meaningless, so overwrite as unscored.
@@ -833,7 +858,7 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     try:
         # Band power needs the filtered signal; staging deliberately does not.
         bp = compute_bandpower(
-            raw.copy().filter(0.5, 40.0, fir_design="firwin", verbose="ERROR"), ch)
+            raw.copy().filter(0.5, 40.0, fir_design="firwin", verbose="ERROR"), used[0])
         if not bp.empty:
             plot_bandpower(bp, bandpower_png,
                            f"{name} — relative band power ({ch})")
