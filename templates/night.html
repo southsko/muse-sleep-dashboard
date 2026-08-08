@@ -74,25 +74,18 @@
     <dl class="kv" style="margin-top:.7rem">
       {{ stat('REM', 'pct_REM', '%.1f%% (%s)'|format(n.pct_REM, n.REM|dur) if n.pct_REM is not none else '—', '%') }}
       {{ stat('N3 deep', 'pct_N3', '%.1f%% (%s)'|format(n.pct_N3, n.N3|dur) if n.pct_N3 is not none else '—', '%') }}
-      {% if n.pct_N3 is not none and n.pct_N3 < 2 %}
-      <dt></dt><dd class="note" style="margin:0">
-        Near-zero N3 is expected on this hardware, not necessarily a finding —
-        see the note below.</dd>
-      {% endif %}
       <dt>N2</dt><dd>{{ '%.1f%% (%s)'|format(n.pct_N2, n.N2|dur) if n.pct_N2 is not none else '—' }}</dd>
       <dt>N1</dt><dd>{{ '%.1f%% (%s)'|format(n.pct_N1, n.N1|dur) if n.pct_N1 is not none else '—' }}</dd>
       <dt>Wake</dt><dd>{{ n.WAKE|dur }}</dd>
     </dl>
     <p class="note">
-      <strong>N3 is not reliably measurable with this headband.</strong> Deep
-      sleep is scored from slow waves above ~75&nbsp;µV, but the Muse references
-      its frontal electrodes to FPz only a few centimetres away, so the measured
-      amplitude is a fraction of a clinical montage (which spans electrode to
-      mastoid). Verified on real data: yasa's slow-wave detector found 9 waves
-      meeting clinical criteria in a 60-minute stretch, where genuine N3 would
-      show thousands. Treat N3 near zero as a limitation of the sensor, not as
-      an absence of deep sleep. TST and efficiency are correspondingly
-      under-estimates.
+      Staging uses a <strong>bipolar frontal-to-ear derivation</strong>
+      (AF7&minus;TP10, AF8&minus;TP9). The Muse's native forehead-to-FPz signal
+      reads as mostly wake to YASA and never finds deep sleep; subtracting the
+      ear electrode (which sits near the mastoid) gives the long-dipole montage
+      YASA was trained on, recovering realistic sleep and N3. Absolute figures
+      are still approximate — this is a consumer headband, not clinical PSG — but
+      the shape of the night and night-to-night trends are the point.
     </p>
     {% else %}
     <p class="empty">No staging for this recording.</p>

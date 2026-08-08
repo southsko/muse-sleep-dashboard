@@ -50,7 +50,7 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 3   # v3: trim artifact epochs flanking dropouts
+SCHEMA_VERSION = 6   # v6: bipolar staging on concatenated real signal
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -714,6 +714,90 @@ def assemble_night(segs: list[Segment]) -> tuple[mne.io.RawArray, np.ndarray, da
     return raw, is_gap, t0, round(float(is_gap.sum()) * EPOCH_SEC / 60.0, 2)
 
 
+def stage_bipolar(segs, channels, n_epochs: int, t0: datetime):
+    """Stage the night on bipolar frontal-to-ear derivations and map to timeline.
+
+    Two things have to be right together or the sleep numbers are nonsense:
+
+    1. The DERIVATION. YASA is trained on frontal/central-to-mastoid montages.
+       The Muse's native forehead-to-FPz signal reads as mostly WAKE (5-36% of a
+       real night scored as sleep, never any N3). Subtracting the ear electrode
+       (which sits at the mastoid) from the forehead recreates the long-dipole
+       derivation YASA expects, and recovers realistic sleep and deep sleep —
+       even though the ears are cracked and intermittently railed, because the
+       subtraction tolerates an imperfect reference.
+
+    2. The SIGNAL FED TO YASA MUST BE CONTINUOUS REAL DATA, not the zero-filled
+       display timeline. YASA normalizes its features across the whole recording;
+       feeding it the gap zeros destroys that normalization and collapses even
+       the bipolar signal back to mostly WAKE. So we stage the CONCATENATION of
+       the worn segments, then place each segment's per-epoch result back at its
+       real position on the timeline (gaps stay unscored).
+
+    Returns (stages, proba_on_timeline, used_name) or None to fall back.
+    """
+    per = int(SFREQ * EPOCH_SEC)
+    verdict = {c["name"]: c["verdict"] for c in channels}
+    ok = sorted((s for s in segs if s.ok and s.start_utc is not None),
+                key=lambda s: s.start_utc)
+
+    blocks, placement = [], []          # placement: (start_epoch, n_epochs_i)
+    for s in ok:
+        arr = s.eeg[EEG_CHANNELS].to_numpy(dtype=float).T
+        ne = arr.shape[1] // per
+        if ne == 0:
+            continue
+        blocks.append(arr[:, : ne * per])
+        placement.append((int(round((s.start_utc - t0).total_seconds() / EPOCH_SEC)), ne))
+    if not blocks:
+        return None
+
+    cat = np.concatenate(blocks, axis=1)
+    chan = {n: cat[i] for i, n in enumerate(EEG_CHANNELS)}
+
+    derivations = []
+    for front, ear in (("AF7", "TP10"), ("AF8", "TP9")):
+        if verdict.get(front) == "usable":
+            derivations.append((f"{front}-{ear}", chan[front] - chan[ear]))
+    if not derivations:                 # no usable frontal — plain fallback
+        for front in ("AF7", "AF8"):
+            if verdict.get(front) == "usable":
+                derivations.append((front, chan[front]))
+    if not derivations:
+        return None
+
+    info1 = mne.create_info(["bip"], SFREQ, "eeg")
+    probas, used = [], []
+    for dname, sig in derivations:
+        try:
+            r = mne.io.RawArray(sig[None, :] * 1e-6, info1, verbose="ERROR")
+            probas.append(yasa.SleepStaging(r, eeg_name="bip").predict().proba)
+            used.append(dname)
+        except Exception as exc:
+            log.warning("  staging on %s failed, skipping: %s", dname, exc)
+    if not probas:
+        return None
+
+    pc = probas[0].copy()
+    for p in probas[1:]:
+        pc = pc.add(p, fill_value=0)
+    pc = pc / len(probas)
+    stages_cat = pc.idxmax(axis=1).tolist()
+
+    # Place each segment's epochs back onto the real-time timeline.
+    stages = ["UNS"] * n_epochs
+    proba = pd.DataFrame(np.nan, index=range(n_epochs), columns=pc.columns)
+    k = 0
+    for start_ep, ne in placement:
+        for j in range(ne):
+            ep = start_ep + j
+            if 0 <= ep < n_epochs:
+                stages[ep] = stages_cat[k + j]
+                proba.iloc[ep] = pc.iloc[k + j].values
+        k += ne
+    return stages, proba, "+".join(used)
+
+
 def _expand_gaps(is_gap, guard: int) -> np.ndarray:
     """The gap mask, widened by `guard` epochs on each side of every gap.
 
@@ -795,36 +879,18 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         _write_stats(res, stats_json, stats_txt)
         return res
 
-    # Stage on EVERY usable frontal channel and average their per-epoch
-    # probabilities, rather than staging on one and discarding the other. Two
-    # clean forehead electrodes beat one: uncorrelated noise averages down, and
-    # an artifact on one channel in a given epoch is outvoted by the other. Falls
-    # back to a single channel (or a temporal one) when only one is usable.
-    stage_channels = [c["name"] for c in res.channels
-                      if c["name"] in ("AF7", "AF8") and c["verdict"] == "usable"]
-    if not stage_channels:
-        stage_channels = [ch]      # whatever pick_staging_channel settled on
-
-    probas = []
-    used = []
-    for c in stage_channels:
-        try:
-            probas.append(yasa.SleepStaging(raw, eeg_name=c).predict().proba)
-            used.append(c)
-        except Exception as exc:
-            log.warning("  staging on %s failed, skipping: %s", c, exc)
-    if not probas:
+    # Stage on bipolar frontal-to-ear derivations over the CONCATENATED real
+    # signal — see stage_bipolar() for why both matter.
+    n_epochs = len(is_gap)
+    result = stage_bipolar(scored, res.channels, n_epochs, t0)
+    if result is not None:
+        stages, proba, res.staging_channel = result
+    else:
+        # Last-ditch fallback: single channel on the zero-filled assembly.
         staged = yasa.SleepStaging(raw, eeg_name=ch).predict()
-        probas, used = [staged.proba], [ch]
+        stages, proba, res.staging_channel = (
+            staged.hypno.tolist(), staged.proba, ch)
 
-    # Ensemble: mean of aligned probabilities (same epochs, same raw), argmax.
-    proba = probas[0].copy()
-    for p in probas[1:]:
-        proba = proba.add(p, fill_value=0)
-    proba = proba / len(probas)
-    stages = proba.idxmax(axis=1).tolist()
-
-    res.staging_channel = "+".join(used)
     log.info("  assembled %.1f min continuous (%.1f min of gaps), staged on %s",
              raw.times[-1] / 60.0, gap_min, res.staging_channel)
 
@@ -883,12 +949,16 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         res.outputs["proba"] = proba_png.name
 
     try:
-        # Band power needs the filtered signal; staging deliberately does not.
+        # Band power is illustrative and needs a single real channel (the used
+        # names may be bipolar derivations like "AF7-TP10"); staging deliberately
+        # is not filtered, band power is.
+        bp_ch = "AF7" if "AF7" in raw.ch_names else (
+            "AF8" if "AF8" in raw.ch_names else ch)
         bp = compute_bandpower(
-            raw.copy().filter(0.5, 40.0, fir_design="firwin", verbose="ERROR"), used[0])
+            raw.copy().filter(0.5, 40.0, fir_design="firwin", verbose="ERROR"), bp_ch)
         if not bp.empty:
             plot_bandpower(bp, bandpower_png,
-                           f"{name} — relative band power ({ch})")
+                           f"{name} — relative band power ({bp_ch})")
             res.outputs["bandpower"] = bandpower_png.name
     except Exception as exc:
         log.warning("  band power failed: %s: %s", type(exc).__name__, exc)

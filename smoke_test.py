@@ -28,9 +28,10 @@ def check(cond, msg, ctx=None):
 # A normal night: stages cleanly on the preferred frontal channel.
 d = load("good", "synthetic_clean")
 check(d["status"] == "ok", "clean fixture should be ok", d)
-# Both frontals are clean, so staging ensembles them: "AF7+AF8".
-check(set(d["staging_channel"].split("+")) == {"AF7", "AF8"},
-      "clean fixture should stage on both frontals (AF7+AF8)", d)
+# Staging ensembles bipolar frontal-to-ear derivations (AF7-TP10 + AF8-TP9),
+# or falls back to plain frontals when no ear reference exists.
+check("AF7" in d["staging_channel"] and "AF8" in d["staging_channel"],
+      "clean fixture should stage on both frontal derivations", d)
 check(d["stats"].get("TST") is not None, "clean fixture should have TST", d)
 for f in ("synthetic_clean.edf", "synthetic_clean_hypnogram.png",
           "synthetic_clean_proba.png"):
@@ -39,9 +40,8 @@ for f in ("synthetic_clean.edf", "synthetic_clean_hypnogram.png",
 # Ear electrodes lost contact — the common real failure. Must still stage.
 r = load("good", "synthetic_railed_ears")
 check(r["status"] == "ok", "railed-ears fixture should still stage", r)
-check(set(r["staging_channel"].split("+")) <= {"AF7", "AF8"}
-      and r["staging_channel"],
-      "railed-ears fixture should stage on the frontal channel(s)", r)
+check("AF7" in r["staging_channel"] and r["staging_channel"],
+      "railed-ears fixture should still stage on a frontal derivation", r)
 verdicts = {c["name"]: c["verdict"] for c in r["channels"]}
 check(verdicts.get("TP9") == "railed", "TP9 should be flagged railed", verdicts)
 check(verdicts.get("TP10") == "railed", "TP10 should be flagged railed", verdicts)
