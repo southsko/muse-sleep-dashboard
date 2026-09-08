@@ -8,6 +8,7 @@ Files here run on the **Pi**, not on the server.
 | `setup-pi5.sh` | Provisioning: venv + muselsl + liblsl, recorder, systemd unit, Samba share |
 | `muse-autorecord.sh` | The supervised recorder itself |
 | `muse_status.py` / `install-status.sh` | Live status page (see below) |
+| `muse_athena_record.py` / `muse-athena-record.service` / `install-athena.sh` | **Muse S Athena** recorder (OpenMuse). Scaffold — validate before switching (see below) |
 
 ## Installing on a fresh Pi
 
@@ -202,3 +203,51 @@ Muse emits telemetry — and whether the extra subscription perturbs the link �
 unverified. Test with a charged headband on: stop the recorder, run muse_stream.py
 by hand for ~30 s, confirm it logs `[battery NN%]` and that both EEG and Battery
 LSL streams appear, then swap the line and restart. Revert is one line.
+
+## Muse S Athena (OpenMuse) — validate-when-it-lands
+
+The Gen-1 stack above uses **muselsl**, which does not properly support Athena
+(3rd-gen) firmware. The Athena recorder uses **OpenMuse** instead, which records
+raw BLE packets to a `.txt` and decodes to samples in Python — so capture and
+decode live in one script, `muse_athena_record.py`.
+
+It writes the **same CSV the server already accepts** — `timestamps,TP9,AF7,AF8,TP10`,
+microvolts, unix-epoch seconds — so nothing on the analysis side changes. The
+decode→CSV path is tested against the real `analyze.load_csv` (a stubbed decode,
+30 s: correct columns, UTC start, 256 Hz). What is **not** yet verified is
+everything device-side, and each such spot is marked `# VALIDATE` in the script:
+
+- the exact OpenMuse CLI flags (`--preset`, `--outfile`, whether `--record` is needed);
+- preset **p60** (EEG4 / no optics / **LED off**) — OpenMuse's own default is `p1041`
+  (all channels); siblings to try if p60 misbehaves: p50, p51, p61;
+- the decoded EEG frame's dict key and column names/casing;
+- the `time` column's units (the script derives epoch stamps from the record-start
+  clock, so a wrong `time` unit cannot corrupt the timeline);
+- that sample **units are µV** (rails ±1000 on a table, tens–hundreds on-head).
+
+### Install without disturbing Gen-1
+
+    bash install-athena.sh            # installs + enables, does NOT start; Gen-1 untouched
+
+Then, **device in hand and charged**, validate before switching:
+
+    ~/muse-env/bin/OpenMuse find
+    ~/muse-env/bin/OpenMuse record --address <MAC> --preset p60 --duration 60 --outfile /tmp/t.txt
+    ~/muse-env/bin/python ~/muse_athena_record.py --decode-only /tmp/t.txt
+    column -s, -t < /tmp/t.csv | head          # 4 EEG cols, µV-looking, epoch timestamps
+
+Confirm the LED is off and the columns/units are right, fixing any `# VALIDATE`
+point that's wrong. Only then hand over:
+
+    bash install-athena.sh --switch   # stops+disables Gen-1 muse-record, starts Athena
+
+Revert is `systemctl disable --now muse-athena-record && systemctl enable --now muse-record`.
+
+### Design notes carried over
+
+Segments are still **hourly** (`SEGMENT_SEC=3600`) and merged into one night on
+the server. The Bluetooth-recovery logic (reset, verify the adapter actually came
+back up, escalate) is ported from the Gen-1 supervisor. On a **Pi 3** a USB BLE
+dongle (CSR8510) is the fix if overnight drops are frequent — note it, don't
+pre-solve. MAC is never committed: it lives in `~/.config/muse/athena.env`
+(written by the installer) or is discovered at runtime via `OpenMuse find`.

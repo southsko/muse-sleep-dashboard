@@ -1,0 +1,30 @@
+[Unit]
+Description=Muse S Athena overnight EEG capture (OpenMuse)
+# BLE needs the adapter up; nothing here needs the network.
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+# __USER__ / __HOME__ are substituted with the real account by install-athena.sh
+# so no username is committed to this (public) repo.
+User=__USER__
+# Device MAC + preset live off the committed tree, in a root-writable env file
+# the installer creates. Leading '-' so a missing file doesn't block startup
+# (the script can still discover the MAC with `OpenMuse find`).
+EnvironmentFile=-__HOME__/.config/muse/athena.env
+
+# The script resets the adapter itself (with verification) before each attempt,
+# so there is no fragile absolute-path ExecStartPre here.
+ExecStart=__HOME__/muse-env/bin/python __HOME__/muse_athena_record.py
+
+# Overnight capture. The script loops segments internally and exits 0 cleanly on
+# SIGTERM, so only restart on actual failure.
+Restart=on-failure
+RestartSec=10
+# Give the current segment a moment to be killed and decoded on stop.
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
