@@ -5,6 +5,14 @@ services:
     container_name: muse-analysis
     restart: unless-stopped
 
+    # Bound memory so a heavy night can't drive the (shared, often-full) Unraid
+    # host into the OOM killer — which silently killed this container (exit 137)
+    # and left it dead for 11 days. With a cgroup limit it gets restarted cleanly
+    # by the policy above instead. 3g is comfortably above a lean night's peak
+    # (analyze.py loads only the EEG columns as float32) and well under host RAM.
+    mem_limit: 3g
+    mem_reservation: 512m
+
     environment:
       # once | cron | watch
       MODE: cron

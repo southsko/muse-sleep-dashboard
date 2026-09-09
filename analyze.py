@@ -199,8 +199,17 @@ def detect_local_tz(stem: str, first_utc: datetime | None) -> timezone | None:
 
 
 def load_csv(path: Path) -> tuple[pd.DataFrame, datetime | None, float | None]:
-    """Read a muselsl CSV and return (eeg_uv, start_datetime, measured_sfreq)."""
-    df = pd.read_csv(path)
+    """Read a recording CSV and return (eeg_uv, start_datetime, measured_sfreq).
+
+    Reads ONLY the timestamp + 4 EEG columns, never the whole file. A recording
+    can carry extra columns (muselsl's Right AUX; a future optics dump) and every
+    segment of a night is held in memory at once before assembly — loading all
+    columns as float64 was the analyzer's memory peak and a path to OOM. EEG is
+    downcast to float32 (µV needs nothing more); the timestamp stays float64
+    because epoch-second precision does not survive float32.
+    """
+    want = {"timestamps", *EEG_CHANNELS}
+    df = pd.read_csv(path, usecols=lambda c: c in want)
 
     missing = [c for c in EEG_CHANNELS if c not in df.columns]
     if missing:
