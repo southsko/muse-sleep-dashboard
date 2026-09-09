@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""Live signal view for the Muse recorder — a local Mind-Monitor-style page.
+"""Live signal view for the Muse S Athena recorder — a local Mind-Monitor page.
 
-Runs ON THE PI, alongside the recorder. Attaches a SECOND read-only inlet to the
-same LSL stream `muselsl record` is already consuming: LSL supports multiple
-consumers, and the inlet sits downstream of the BLE link, so it cannot affect
-the radio. Nothing here writes, and nothing here can stop the recorder.
+Runs ON THE PI, alongside the OpenMuse recorder. The recorder writes raw BLE
+packets to a growing .txt in ~/recordings/raw/; this page *tails* that file (reads
+only the last chunk), decodes the recent packets with OpenMuse, and shows live
+EEG, contact quality, per-channel band power, and battery.
 
-Why this exists at all: the Muse accepts exactly ONE Bluetooth connection.
-Opening Mind Monitor on a phone steals the link and kills the night's recording.
-This page is the only way to check fit and signal without costing you data.
+Why tail the file instead of a second Bluetooth connection: the Muse accepts
+exactly ONE BLE link, and the recorder holds it. Reading the file the recorder is
+already writing costs nothing on the radio and cannot perturb or stop the night —
+the same safety the Gen-1 LSL-inlet page had, without needing an LSL stream that
+OpenMuse's file recorder doesn't produce.
 
-Deliberately uses the standard library only — no Flask, no framework. The
-recorder Pi should not grow dependencies for a nice-to-have.
+Reads only the TAIL of the raw file (never the whole thing, which is hundreds of
+MB by morning), so memory stays flat regardless of how long the night runs.
 
-    python3 muse_status.py            # serves on :8080
-    PORT=9000 python3 muse_status.py
+Standard library for the server; the decode borrows OpenMuse + numpy/scipy from
+the recorder's venv (the systemd unit runs this under that venv).
+
+    <venv>/bin/python3 muse_status.py       # serves on :8080
+    PORT=9000 <venv>/bin/python3 muse_status.py
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import threading
@@ -37,6 +43,11 @@ CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
 CHANNEL_LABELS = {"TP9": "left ear", "AF7": "left forehead",
                   "AF8": "right forehead", "TP10": "right ear"}
 
+RAWDIR = os.path.expanduser("~/recordings/raw")
+RECDIR = os.path.expanduser("~/recordings")
+TAIL_BYTES = 131072                # only ever read the last 128 KB of the raw file
+POLL_SEC = 0.5                     # how often to re-tail and decode
+
 BUFFER_SEC = 12.0                  # rolling window kept in memory
 DISPLAY_HZ = 51.2                  # decimated rate sent to the browser
 DECIMATE = int(SFREQ / DISPLAY_HZ)  # 5 -> 51.2 Hz, plenty for a visual trace
@@ -45,7 +56,9 @@ QUALITY_SEC = 2.0                  # window for contact quality
 BAND_SEC = 4.0                     # window for band power
 
 # Same thresholds the analysis pipeline uses, so what you see while fitting the
-# band matches how the night will actually be judged.
+# band matches how the night will actually be judged. Rail check is on the
+# excursion from the channel's own median — Athena rides a ~700µV DC offset, so an
+# absolute |x|>900 test would read a clean channel as railed (see analyze.py).
 RAIL_UV = 900.0
 RAIL_FRACTION = 0.20
 FLAT_STD_UV = 1.0
@@ -55,79 +68,91 @@ BANDS = [("Delta", 0.5, 4.0), ("Theta", 4.0, 8.0), ("Alpha", 8.0, 12.0),
 
 
 class Collector:
-    """Pulls from LSL in a background thread into a rolling buffer."""
+    """Tails the recorder's raw .txt in a background thread, decoding recent
+    packets into a rolling EEG buffer. No Bluetooth, no LSL — just the file."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.buf = deque(maxlen=int(BUFFER_SEC * SFREQ))
+        self.buf = deque(maxlen=int(BUFFER_SEC * SFREQ))   # rows of 4 channels, µV
         self.connected = False
         self.samples = 0
         self.last_sample_at = 0.0
         self.started = time.time()
-        self.rate = 0.0
         self._recent = deque(maxlen=64)
-        # Battery arrives on a separate low-rate LSL stream (see muse_stream.py).
-        # None until a reading lands — the page shows "—" rather than a fake 0%.
-        self.battery = None
+        self.battery = None            # from the Athena BATTERY frame; None until seen
         self.battery_at = 0.0
+        self._cur_file = None
+        self._last_ts = ""             # ISO timestamp of the last raw line ingested
+
+    def _newest_raw(self) -> str | None:
+        files = glob.glob(os.path.join(RAWDIR, "*.txt"))
+        return max(files, key=os.path.getmtime) if files else None
+
+    def _tail_lines(self, path: str) -> list[str]:
+        """Last TAIL_BYTES of the file as whole lines (drop a partial first)."""
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+            data = f.read()
+        lines = data.decode("utf-8", errors="replace").split("\n")
+        if size > TAIL_BYTES:
+            lines = lines[1:]          # first line is probably truncated
+        return [ln for ln in lines if ln.strip()]
 
     def run(self) -> None:
-        from pylsl import StreamInlet, resolve_byprop
+        import OpenMuse
+        import pandas as pd
         while True:
             try:
-                streams = resolve_byprop("type", "EEG", timeout=5)
-                if not streams:
+                path = self._newest_raw()
+                if not path:
                     self.connected = False
-                    time.sleep(2)
+                    time.sleep(1.0)
                     continue
-                inlet = StreamInlet(streams[0], max_chunklen=32, recover=False)
-                self.connected = True
-                while True:
-                    chunk, _ = inlet.pull_chunk(timeout=2.0, max_samples=64)
-                    if not chunk:
-                        # The stream went away; drop back to resolving.
-                        if time.time() - self.last_sample_at > 5:
-                            self.connected = False
-                            break
-                        continue
-                    now = time.time()
-                    with self.lock:
-                        for row in chunk:
-                            self.buf.append(row[:4])
-                        self.samples += len(chunk)
-                        self._recent.append((now, len(chunk)))
-                    self.last_sample_at = now
+                if path != self._cur_file:          # rolled to a new segment
+                    self._cur_file = path
+                    self._last_ts = ""
+                lines = self._tail_lines(path)
+                # Each raw line begins with an ISO-8601 timestamp; they sort
+                # lexically = chronologically, so keep only lines newer than the
+                # last one ingested. This dedups the overlapping tail robustly,
+                # without depending on how decode assigns its own 'time' column.
+                new = [ln for ln in lines
+                       if ln.split("\t", 1)[0] > self._last_ts]
+                if new:
+                    self._last_ts = new[-1].split("\t", 1)[0]
+                    self._ingest(OpenMuse.decode_rawdata(new), pd)
+                if time.time() - self.last_sample_at > 4:
+                    self.connected = False
+                time.sleep(POLL_SEC)
             except Exception:
                 self.connected = False
-                time.sleep(2)
+                time.sleep(1.0)
 
-    def run_battery(self) -> None:
-        """Separate thread: read the low-rate Muse_Battery stream if present.
-
-        Kept apart from the EEG loop so a missing battery stream (e.g. the
-        recorder is still on the old `muselsl stream`) never affects EEG or
-        contact display — battery just stays None and the page shows "—".
-        """
-        from pylsl import StreamInlet, resolve_byprop
-        while True:
-            try:
-                streams = resolve_byprop("type", "Battery", timeout=5)
-                if not streams:
-                    time.sleep(5)
-                    continue
-                inlet = StreamInlet(streams[0], recover=False)
-                while True:
-                    sample, _ = inlet.pull_sample(timeout=5.0)
-                    if sample is None:
-                        if time.time() - self.battery_at > 30:
-                            with self.lock:
-                                self.battery = None
-                        continue
-                    with self.lock:
-                        self.battery = round(float(sample[0]), 1)
-                        self.battery_at = time.time()
-            except Exception:
-                time.sleep(5)
+    def _ingest(self, data: dict, pd) -> None:
+        now = time.time()
+        eeg = data.get("EEG")
+        if eeg is not None and len(eeg):
+            # Athena columns are prefixed EEG_TP9 etc.; map tolerantly.
+            colmap = {str(c).lower().replace(" ", "").removeprefix("eeg_"): c
+                      for c in eeg.columns}
+            if all(ch.lower() in colmap for ch in CHANNELS):
+                arr = np.column_stack([
+                    pd.to_numeric(eeg[colmap[ch.lower()]], errors="coerce").to_numpy()
+                    for ch in CHANNELS])
+                with self.lock:
+                    for row in arr:
+                        self.buf.append(row)
+                    self.samples += len(arr)
+                    self._recent.append((now, len(arr)))
+                self.last_sample_at = now
+                self.connected = True
+        bat = data.get("BATTERY")
+        if bat is not None and len(bat) and "battery_percent" in bat.columns:
+            with self.lock:
+                self.battery = round(float(bat["battery_percent"].iloc[-1]), 1)
+                self.battery_at = now
 
     def snapshot(self) -> np.ndarray:
         with self.lock:
@@ -156,7 +181,8 @@ def quality(arr: np.ndarray) -> dict:
             out[name] = {"verdict": "no data", "std": 0.0, "railed": 0.0}
             continue
         x = seg[:, i]
-        railed = float(np.mean(np.abs(x) > RAIL_UV))
+        xc = x - np.median(x)          # DC-agnostic, like analyze.py
+        railed = float(np.mean(np.abs(xc) > RAIL_UV))
         std = float(np.std(x))
         if railed > RAIL_FRACTION:
             verdict = "railed"
@@ -180,6 +206,7 @@ def bandpower(arr: np.ndarray, ch_index: int) -> dict:
     if len(arr) < n // 2:
         return {name: 0.0 for name, _, _ in BANDS}
     x = arr[-n:, ch_index]
+    x = x - np.median(x)               # drop the DC offset before the spectrum
     f, p = welch(x, fs=SFREQ, nperseg=min(len(x), 512))
     total = trapezoid(p[(f >= 0.5) & (f < 30)], f[(f >= 0.5) & (f < 30)])
     if total <= 0:
@@ -192,13 +219,15 @@ def bandpower(arr: np.ndarray, ch_index: int) -> dict:
 
 
 def current_segment() -> dict:
-    """Whatever the recorder is writing right now."""
-    import glob
-    d = os.path.expanduser("~/recordings")
-    files = sorted(glob.glob(os.path.join(d, "*.csv")), key=os.path.getmtime)
-    if not files:
+    """What the recorder is writing right now — the growing raw .txt if a segment
+    is live, else the most recent decoded CSV."""
+    raws = glob.glob(os.path.join(RAWDIR, "*.txt"))
+    f = max(raws, key=os.path.getmtime) if raws else None
+    if not f:
+        csvs = glob.glob(os.path.join(RECDIR, "*.csv"))
+        f = max(csvs, key=os.path.getmtime) if csvs else None
+    if not f:
         return {"name": None, "mb": 0.0, "age": None}
-    f = files[-1]
     return {"name": os.path.basename(f),
             "mb": round(os.path.getsize(f) / 1e6, 1),
             "age": round(time.time() - os.path.getmtime(f), 1)}
@@ -210,8 +239,8 @@ COLLECTOR = Collector()
 def frame() -> dict:
     arr = COLLECTOR.snapshot()
     rate = COLLECTOR.data_rate()
-    # Treat "connected" as data actually arriving, not merely a resolved stream:
-    # a stalled link keeps the inlet open while delivering nothing.
+    # Treat "connected" as data actually arriving, not merely a file existing:
+    # a stalled link leaves the raw file present but not growing.
     live = COLLECTOR.connected and rate > 50
     traces = {}
     if len(arr):
@@ -223,7 +252,8 @@ def frame() -> dict:
         "rate": round(rate, 1),
         "uptime": round(time.time() - COLLECTOR.started),
         "quality": quality(arr),
-        "bands": bandpower(arr, CHANNELS.index("AF7")),
+        # Band power for ALL four sensors, not just AF7.
+        "bands": {ch: bandpower(arr, i) for i, ch in enumerate(CHANNELS)},
         "segment": current_segment(),
         "battery": COLLECTOR.battery,
         "traces": traces,
@@ -269,10 +299,13 @@ canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px
 .wrap{margin-bottom:.5rem}
 .wrap .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
   margin-bottom:.15rem}
-.bars{display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;align-items:end;height:90px}
+.bandgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}
+.bandcell .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
+  margin-bottom:.35rem}
+.bars{display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;align-items:end;height:80px}
 .bar{background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;transition:height .2s}
-.blbl{display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-top:.3rem;
-  font-size:.7rem;color:var(--muted);text-align:center}
+.blbl{display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-top:.3rem;
+  font-size:.66rem;color:var(--muted);text-align:center}
 </style></head><body>
 <header>
   <h1>MUSE · LIVE</h1>
@@ -285,20 +318,24 @@ canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px
   <div id="battwarn" class="battwarn"></div>
   <div class="panel"><h2>Electrode contact</h2><div id="q" class="chgrid"></div></div>
   <div class="panel"><h2>Live signal <span id="hz" class="stat"></span></h2><div id="waves"></div></div>
-  <div class="panel"><h2>Band power · AF7</h2>
-    <div class="bars" id="bars"></div>
-    <div class="blbl"><div>Delta</div><div>Theta</div><div>Alpha</div><div>Sigma</div><div>Beta</div></div>
-  </div>
+  <div class="panel"><h2>Band power · all sensors</h2><div id="bandgrid" class="bandgrid"></div></div>
 </main>
 <script>
 const CH=["TP9","AF7","AF8","TP10"], canv={};
 const LBL={TP9:'left ear',AF7:'left forehead',AF8:'right forehead',TP10:'right ear'};
+const BANDS=["Delta","Theta","Alpha","Sigma","Beta"];
 const wraps=document.getElementById('waves');
 CH.forEach(c=>{const d=document.createElement('div');d.className='wrap';
   d.innerHTML='<div class="lbl">'+c+' <span style="opacity:.6">· '+LBL[c]+'</span></div>';
   const cv=document.createElement('canvas');d.appendChild(cv);wraps.appendChild(d);canv[c]=cv;});
-const bars=CH.map(()=>0);
-document.getElementById('bars').innerHTML=[0,1,2,3,4].map(i=>'<div class="bar" id="b'+i+'"></div>').join('');
+
+// One band-power panel per sensor.
+const bg=document.getElementById('bandgrid');
+CH.forEach(c=>{const d=document.createElement('div');d.className='bandcell';
+  d.innerHTML='<div class="lbl">'+c+' <span style="opacity:.6">· '+LBL[c]+'</span></div>'+
+    '<div class="bars">'+BANDS.map((b,i)=>'<div class="bar" id="bar_'+c+'_'+i+'"></div>').join('')+'</div>'+
+    '<div class="blbl">'+BANDS.map(b=>'<div>'+b+'</div>').join('')+'</div>';
+  bg.appendChild(d);});
 
 function draw(cv,data){
   const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
@@ -306,7 +343,6 @@ function draw(cv,data){
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
   x.clearRect(0,0,w,h);
   if(!data||!data.length)return;
-  // Autoscale to the window, clamped so a flat trace does not explode.
   let mx=0;for(const v of data)mx=Math.max(mx,Math.abs(v));
   mx=Math.max(mx,20);
   x.strokeStyle='#252b34';x.lineWidth=1;x.beginPath();x.moveTo(0,h/2);x.lineTo(w,h/2);x.stroke();
@@ -328,9 +364,6 @@ es.onmessage=e=>{
   document.getElementById('hz').textContent='· '+d.display_hz+' Hz shown';
   document.getElementById('seg').textContent=
     d.segment.name?(d.segment.name+' · '+d.segment.mb+' MB'):'no segment';
-  // Battery: null until a reading arrives (recorder may still be on the old
-  // stream). Colour and warn by level — the thing that would have flagged the
-  // low-battery night before it happened.
   const be=document.getElementById('batt'), bw=document.getElementById('battwarn');
   if(d.battery==null){be.className='stat batt';be.querySelector('b').textContent='—';
     bw.className='battwarn';}
@@ -354,9 +387,9 @@ es.onmessage=e=>{
       '<div class="m">'+q.std+' µV · '+q.railed+'% railed</div></div>';
   }).join('');
   CH.forEach(c=>draw(canv[c],d.traces[c]));
-  ["Delta","Theta","Alpha","Sigma","Beta"].forEach((b,i)=>{
-    document.getElementById('b'+i).style.height=Math.max(2,(d.bands[b]||0)*0.9)+'%';
-  });
+  CH.forEach(c=>{const b=d.bands[c]||{};
+    BANDS.forEach((name,i)=>{const el=document.getElementById('bar_'+c+'_'+i);
+      if(el)el.style.height=Math.max(2,(b[name]||0)*0.9)+'%';});});
 };
 es.onerror=()=>{document.getElementById('conn').innerHTML=
   '<span class="dot dead"></span>page disconnected';};
@@ -406,7 +439,6 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     threading.Thread(target=COLLECTOR.run, daemon=True).start()
-    threading.Thread(target=COLLECTOR.run_battery, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     print(f"muse status page on :{PORT}", flush=True)

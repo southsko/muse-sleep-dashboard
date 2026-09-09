@@ -28,8 +28,8 @@ else
 fi
 python3 -c "import ast;ast.parse(open('${DEST}').read())" && echo "    syntax OK"
 
-echo "==> checking dependencies (stdlib + pylsl/numpy/scipy, all already present)"
-"${VENV}/bin/python3" -c "import pylsl, numpy, scipy; print('    deps OK')"
+echo "==> checking dependencies (stdlib + OpenMuse/numpy/scipy from the venv)"
+"${VENV}/bin/python3" -c "import OpenMuse, numpy, scipy; print('    deps OK')"
 
 echo "==> systemd unit"
 sudo tee /etc/systemd/system/muse-status.service >/dev/null <<UNIT
@@ -47,9 +47,11 @@ ExecStart=${VENV}/bin/python3 ${HOME_DIR}/muse_status.py
 Restart=always
 RestartSec=10
 
-# Hard caps. The recorder must always win a contest for resources.
+# Hard caps. The recorder must always win a contest for resources. 512M (not
+# 256M) because importing OpenMuse + numpy/scipy/pandas for the decode sits at
+# ~155M RSS on its own; 512M leaves headroom and is nothing on a 4-8GB Pi 5.
 CPUQuota=25%
-MemoryMax=256M
+MemoryMax=512M
 Nice=10
 
 [Install]
@@ -57,7 +59,10 @@ WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now muse-status.service
+sudo systemctl enable muse-status.service
+# restart (not just enable --now): a reinstall must pick up the new script, and
+# `enable --now` does nothing when the unit is already running.
+sudo systemctl restart muse-status.service
 sleep 2
 systemctl is-active muse-status.service
 
