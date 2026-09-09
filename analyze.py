@@ -50,7 +50,7 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 7   # v7: auto-detect recorder timezone from filenames
+SCHEMA_VERSION = 8   # v8: DC-agnostic rail check (Athena rides a ~700µV offset)
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -300,7 +300,16 @@ def assess_channels(eeg_uv: pd.DataFrame) -> list[ChannelQuality]:
     out = []
     for name in EEG_CHANNELS:
         x = eeg_uv[name].to_numpy(dtype=float)
-        railed = float(np.mean(np.abs(x) > RAIL_UV)) if x.size else 1.0
+        # Rail check on the excursion from each channel's own baseline, not the
+        # absolute value: the Muse S Athena rides a large (~700 µV) DC offset on
+        # every channel, so an absolute |x|>900 test flagged perfectly good
+        # channels as railed (13-14% on a clean on-head recording — a hair from
+        # the 20% reject threshold). Centering on the median makes the test
+        # DC-agnostic. A swinging amplifier rail still deviates >900 from its
+        # median (so stays railed); a channel pinned flat at a rail centers to
+        # ~0 and is caught by the flat check below instead. Both are "not usable".
+        xc = x - np.median(x) if x.size else x
+        railed = float(np.mean(np.abs(xc) > RAIL_UV)) if x.size else 1.0
         std = float(np.std(x)) if x.size else 0.0
 
         if railed > RAIL_FRACTION:

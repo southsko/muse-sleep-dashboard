@@ -53,11 +53,15 @@ RAWDIR = Path(os.environ.get("RAWDIR", str(OUTDIR / "raw")))
 # — and if still empty we try to discover it with `OpenMuse find`.
 MAC = os.environ.get("MUSE_MAC", "").strip()
 
-# p60 (EEG4 / no optics / LED off) is the brief's hypothesis for lean, dark
-# sleep capture. OpenMuse's own default is p1041 (all channels). The preset list
-# is reverse-engineered — VALIDATE that p60 actually yields 4 EEG channels with
-# the LED off; siblings to try if not: p50, p51, p61.
-PRESET = os.environ.get("MUSE_PRESET", "p60")
+# VALIDATED 2026-09-09 on Athena firmware 3.1.15 (MuseS-D605): the brief's
+# premise that p60 (or p50/p51/p61) gives "EEG4 / no optics / LED off" is FALSE —
+# every preset tried (p20,p21,p50,p51,p60,p61,p1034,p1035,p1041,p1042,p1043,p1044)
+# streams an OPTICS frame, i.e. the fNIRS LEDs stay on. OpenMuse just forwards the
+# preset string to the firmware; there is no known LED-off preset for this build.
+# So default to p1041 (OpenMuse's own, delivers clean 4-ch EEG). The optics
+# columns are simply dropped here; the LED-off goal is unmet at the preset layer
+# (block the sensor physically if the glow matters). Override via MUSE_PRESET.
+PRESET = os.environ.get("MUSE_PRESET", "p1041")
 
 SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly, like Gen 1
 STALL_SEC = int(os.environ.get("STALL_SEC", "90"))        # no growth => dead link
@@ -217,16 +221,21 @@ def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int
         raise RuntimeError(f"no EEG frame in decoded data; keys={list(data)}")
     eeg = data[eeg_key]
 
-    # VALIDATE: confirm channel column names/casing. Match tolerantly so a stray
-    # space or case difference ("Tp9", "AF 7") doesn't drop the recording.
-    lut = {str(c).lower().replace(" ", ""): c for c in eeg.columns}
+    # Athena decodes the EEG columns PREFIXED: EEG_TP9, EEG_AF7, EEG_AF8, EEG_TP10
+    # (confirmed on firmware 3.1.15). Normalise by stripping a leading "eeg_" and
+    # spaces so both the prefixed names and bare "TP9"-style names match.
+    def _norm(c: str) -> str:
+        return str(c).lower().replace(" ", "").removeprefix("eeg_")
+    lut = {_norm(c): c for c in eeg.columns}
     missing = [w for w in EEG_COLS if w.lower() not in lut]
     if missing:
         raise RuntimeError(f"missing EEG channels {missing}; got {list(eeg.columns)}")
 
-    # VALIDATE: confirm units are microvolts. muselsl/YASA convention is µV; the
-    # analyzer multiplies by 1e-6 and rails-checks at ±1000 µV. If OpenMuse emits
-    # volts or raw ADC counts, scale here.
+    # Units are microvolts (confirmed): on-head std ~20-200 µV, but with a large
+    # ~700 µV DC offset on every channel. The analyzer bandpasses 0.5-40 Hz for
+    # staging, which removes that offset — but its raw-µV rail check (|x|>900) can
+    # be tripped by the offset alone, so the server side mean-centres before that
+    # check (see analyze.py). Values pass through here unscaled.
     out = pd.DataFrame(
         {w: pd.to_numeric(eeg[lut[w.lower()]], errors="coerce") for w in EEG_COLS}
     )
