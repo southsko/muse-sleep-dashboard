@@ -53,15 +53,16 @@ RAWDIR = Path(os.environ.get("RAWDIR", str(OUTDIR / "raw")))
 # — and if still empty we try to discover it with `OpenMuse find`.
 MAC = os.environ.get("MUSE_MAC", "").strip()
 
-# VALIDATED 2026-09-09 on Athena firmware 3.1.15 (MuseS-D605): the brief's
-# premise that p60 (or p50/p51/p61) gives "EEG4 / no optics / LED off" is FALSE —
-# every preset tried (p20,p21,p50,p51,p60,p61,p1034,p1035,p1041,p1042,p1043,p1044)
-# streams an OPTICS frame, i.e. the fNIRS LEDs stay on. OpenMuse just forwards the
-# preset string to the firmware; there is no known LED-off preset for this build.
-# So default to p1041 (OpenMuse's own, delivers clean 4-ch EEG). The optics
-# columns are simply dropped here; the LED-off goal is unmet at the preset layer
-# (block the sensor physically if the glow matters). Override via MUSE_PRESET.
-PRESET = os.environ.get("MUSE_PRESET", "p1041")
+# VALIDATED 2026-09-09 on Athena firmware 3.1.15 (MuseS-D605). The preset selects
+# the sensor set AND the optics LEDs (BrainFlow's table, confirmed against decoded
+# data): p20/p21/p50/p51/p60/p61 = EEG4, optics OFF, LED OFF; p1035 = EEG4 + dim
+# optics; p1041 (OpenMuse's default) = EEG8 + bright optics. For overnight sleep
+# use p21 — EEG-only keeps the LEDs off (no glow) and, decisively, far lower power:
+# bright optics drains ~0.7%/min (~2h per charge), EEG-only lasts far longer. The
+# trade is losing PPG/heart-rate, which only the optics presets carry.
+# Caveat that misled an earlier pass: an OPTICS *frame* can decode as present-but-
+# EMPTY on the EEG-only presets — judge by optics ROW COUNT/values, not the key.
+PRESET = os.environ.get("MUSE_PRESET", "p21")
 
 SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly, like Gen 1
 STALL_SEC = int(os.environ.get("STALL_SEC", "90"))        # no growth => dead link

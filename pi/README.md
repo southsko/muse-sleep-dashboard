@@ -204,44 +204,47 @@ unverified. Test with a charged headband on: stop the recorder, run muse_stream.
 by hand for ~30 s, confirm it logs `[battery NN%]` and that both EEG and Battery
 LSL streams appear, then swap the line and restart. Revert is one line.
 
-## Muse S Athena (OpenMuse) — validate-when-it-lands
+## Muse S Athena (OpenMuse) — validated on hardware 2026-09-09
 
-The Gen-1 stack above uses **muselsl**, which does not properly support Athena
-(3rd-gen) firmware. The Athena recorder uses **OpenMuse** instead, which records
-raw BLE packets to a `.txt` and decodes to samples in Python — so capture and
-decode live in one script, `muse_athena_record.py`.
+The Gen-1 stack above uses **muselsl**, which does not support Athena (3rd-gen)
+firmware. The Athena recorder uses **OpenMuse** instead, which records raw BLE
+packets to a `.txt` and decodes to samples in Python — so capture and decode live
+in one script, `muse_athena_record.py`. It writes the **same CSV the server
+already accepts** (`timestamps,TP9,AF7,AF8,TP10`, µV, unix-epoch seconds), so
+nothing on the analysis side changes.
 
-It writes the **same CSV the server already accepts** — `timestamps,TP9,AF7,AF8,TP10`,
-microvolts, unix-epoch seconds — so nothing on the analysis side changes. The
-decode→CSV path is tested against the real `analyze.load_csv` (a stubbed decode,
-30 s: correct columns, UTC start, 256 Hz). What is **not** yet verified is
-everything device-side, and each such spot is marked `# VALIDATE` in the script:
+Confirmed on firmware 3.1.15 (MuseS-D605): OpenMuse CLI flags as scaffolded, EEG
+frame key `EEG`, columns prefixed `EEG_TP9…`, `time` = seconds-from-start, µV
+with a ~700 µV DC offset (the server mean-centres before its rail check).
 
-- the exact OpenMuse CLI flags (`--preset`, `--outfile`, whether `--record` is needed);
-- preset **p60** (EEG4 / no optics / **LED off**) — OpenMuse's own default is `p1041`
-  (all channels); siblings to try if p60 misbehaves: p50, p51, p61;
-- the decoded EEG frame's dict key and column names/casing;
-- the `time` column's units (the script derives epoch stamps from the record-start
-  clock, so a wrong `time` unit cannot corrupt the timeline);
-- that sample **units are µV** (rails ±1000 on a table, tens–hundreds on-head).
+### Preset = sensor set AND power draw (this is the whole game for overnight)
 
-### Install without disturbing Gen-1
+The preset selects channels and the optics LEDs. From BrainFlow's table, confirmed
+against decoded data:
 
-    bash install-athena.sh            # installs + enables, does NOT start; Gen-1 untouched
+| Preset | EEG | Optics / LED | Use |
+|---|---|---|---|
+| **p21** (default here) | EEG4 | **none / off** | **overnight sleep** — no glow, low power |
+| p20, p50, p51, p60, p61 | EEG4 | none / off | equivalents to p21 |
+| p1035 | EEG4 | dim | adds PPG (heart rate) |
+| p1041 (OpenMuse default) | EEG8 | bright | full fNIRS + PPG |
 
-Then, **device in hand and charged**, validate before switching:
+**Bright optics (p1041) drains the battery ~0.7 %/min — ~2 h per charge, nowhere
+near a night.** EEG-only (p21) keeps the LEDs off and lasts far longer; it also
+drops the heavy optics stream, easing the flaky BLE link. The trade is losing
+PPG/heart-rate (the status page shows those only on an optics preset). A stray
+detail that misled the first pass: an OPTICS *frame* can decode as present-but-
+**empty** on the EEG-only presets — judge by optics **row count/values**, not the
+key. Set via `MUSE_PRESET` in `~/.config/muse/athena.env`.
 
-    ~/muse-env/bin/OpenMuse find
-    ~/muse-env/bin/OpenMuse record --address <MAC> --preset p60 --duration 60 --outfile /tmp/t.txt
-    ~/muse-env/bin/python ~/muse_athena_record.py --decode-only /tmp/t.txt
-    column -s, -t < /tmp/t.csv | head          # 4 EEG cols, µV-looking, epoch timestamps
+### Install / cut over from Gen-1
 
-Confirm the LED is off and the columns/units are right, fixing any `# VALIDATE`
-point that's wrong. Only then hand over:
-
+    bash install-athena.sh            # installs + enables (p21), does NOT start; Gen-1 untouched
     bash install-athena.sh --switch   # stops+disables Gen-1 muse-record, starts Athena
 
 Revert is `systemctl disable --now muse-athena-record && systemctl enable --now muse-record`.
+Quick re-check with the band on: `OpenMuse record … --duration 60 …` then
+`muse_athena_record.py --decode-only …` and eyeball the CSV.
 
 ### Design notes carried over
 

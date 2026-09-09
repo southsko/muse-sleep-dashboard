@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 USER_NAME="$(id -un)"
 HOME_DIR="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
 VENV="${VENV:-${HOME_DIR}/muse-env}"
-PRESET="${MUSE_PRESET:-p1041}"   # no LED-off preset exists on fw 3.1.15 (see README)
+PRESET="${MUSE_PRESET:-p21}"     # EEG4, optics/LED OFF — low power for overnight (see README)
 SWITCH=0
 [[ "${1:-}" == "--switch" ]] && SWITCH=1
 
@@ -147,9 +147,9 @@ fi
 cat <<NEXT
 
    Validated on hardware (fw 3.1.15) 2026-09-09: capture works on preset ${PRESET}.
-   Note: NO preset turns the fNIRS LED off on this firmware — the sensor glows all
-   night. Staging is unaffected (optics are dropped); block the sensor physically
-   if the light bothers you.
+   ${PRESET} is EEG-only (optics + LEDs OFF) — no glow and low power for overnight.
+   The optics presets (p1035 dim, p1041 bright) add PPG/heart-rate but drain the
+   battery ~0.7%/min (~2h/charge), so they are not for overnight.
 
    Quick re-check any time (band on head):
      ${VENV}/bin/OpenMuse record --address <MAC> --preset ${PRESET} \\
