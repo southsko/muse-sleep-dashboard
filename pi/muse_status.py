@@ -46,7 +46,10 @@ CHANNEL_LABELS = {"TP9": "left ear", "AF7": "left forehead",
 RAWDIR = os.path.expanduser("~/recordings/raw")
 RECDIR = os.path.expanduser("~/recordings")
 TAIL_BYTES = 131072                # only ever read the last 128 KB of the raw file
-POLL_SEC = 0.5                     # how often to re-tail and decode
+# How often to re-tail and decode. The useful floor is the BLE packet rate
+# (~14-20 EEG notifications/sec) and OpenMuse's file flushing — polling faster
+# than that just re-reads the same bytes. 0.15s (~7 Hz) sits near that ceiling.
+POLL_SEC = float(os.environ.get("POLL_SEC", "0.15"))
 
 BUFFER_SEC = 12.0                  # rolling window kept in memory
 DISPLAY_HZ = 51.2                  # decimated rate sent to the browser
@@ -66,6 +69,14 @@ FLAT_STD_UV = 1.0
 BANDS = [("Delta", 0.5, 4.0), ("Theta", 4.0, 8.0), ("Alpha", 8.0, 12.0),
          ("Sigma", 12.0, 16.0), ("Beta", 16.0, 30.0)]
 
+# The Athena's optics (fNIRS/PPG) and IMU are on the same BLE stream, so the page
+# can show heart rate and movement "for free" from data already arriving — the
+# silver lining of not being able to turn the optics LEDs off.
+PPG_FS = 64.0                      # OPTICS sample rate
+PPG_SEC = 16.0                     # window for a stable heart-rate estimate
+ACC_FS = 52.0                      # ACCGYRO sample rate (approximate)
+ACC_SEC = 8.0                      # window for the movement metric
+
 
 class Collector:
     """Tails the recorder's raw .txt in a background thread, decoding recent
@@ -83,6 +94,10 @@ class Collector:
         self.battery_at = 0.0
         self._cur_file = None
         self._last_ts = ""             # ISO timestamp of the last raw line ingested
+        self.ppg = deque(maxlen=int(PPG_SEC * PPG_FS))   # optics rows (PPG channels)
+        self.acc = deque(maxlen=int(ACC_SEC * ACC_FS))   # accel magnitude, g
+        self._hr = None                # cached heart rate (recomputed ~1/s)
+        self._hr_at = 0.0
 
     def _newest_raw(self) -> str | None:
         files = glob.glob(os.path.join(RAWDIR, "*.txt"))
@@ -148,6 +163,23 @@ class Collector:
                     self._recent.append((now, len(arr)))
                 self.last_sample_at = now
                 self.connected = True
+        opt = data.get("OPTICS")
+        if opt is not None and len(opt):
+            chans = [c for c in opt.columns if c != "time"]
+            if chans:
+                arr = opt[chans].apply(pd.to_numeric, errors="coerce").to_numpy()
+                with self.lock:
+                    for row in arr:
+                        self.ppg.append(row)
+        acc = data.get("ACCGYRO")
+        if acc is not None and len(acc):
+            axc = [c for c in acc.columns if c.startswith("ACC")]
+            if axc:
+                mag = np.linalg.norm(
+                    acc[axc].apply(pd.to_numeric, errors="coerce").to_numpy(), axis=1)
+                with self.lock:
+                    for m in mag:
+                        self.acc.append(float(m))
         bat = data.get("BATTERY")
         if bat is not None and len(bat) and "battery_percent" in bat.columns:
             with self.lock:
@@ -218,6 +250,48 @@ def bandpower(arr: np.ndarray, ch_index: int) -> dict:
     return out
 
 
+def heart_rate(c: "Collector") -> int | None:
+    """Beats/min from the strongest pulsatile PPG (optics) channel — the dominant
+    spectral peak in 0.7-4 Hz (42-240 bpm). Cached ~1s: a Welch over 16 channels
+    is not free at the SSE frame rate."""
+    now = time.time()
+    if now - c._hr_at < 1.0:
+        return c._hr
+    from scipy.signal import welch
+    with c.lock:
+        if len(c.ppg) < int(PPG_FS * 5):
+            c._hr, c._hr_at = None, now
+            return None
+        arr = np.asarray(c.ppg, dtype=float)
+    best_bpm, best_pow = None, 0.0
+    for j in range(arr.shape[1]):
+        x = arr[:, j]
+        if not np.isfinite(x).all() or np.std(x) == 0:
+            continue
+        f, p = welch(x - x.mean(), fs=PPG_FS, nperseg=min(len(x), 512))
+        band = (f >= 0.7) & (f <= 4.0)
+        if not band.any():
+            continue
+        pw = float(p[band].max())
+        if pw > best_pow:
+            best_pow, best_bpm = pw, float(f[band][np.argmax(p[band])]) * 60.0
+    hr = int(round(best_bpm)) if best_bpm else None
+    with c.lock:
+        c._hr, c._hr_at = hr, now
+    return hr
+
+
+def movement(c: "Collector") -> dict:
+    """Restlessness from the accelerometer: std of |acc| (g) over the window."""
+    with c.lock:
+        if len(c.acc) < 8:
+            return {"level": None, "label": "—"}
+        a = np.asarray(c.acc, dtype=float)
+    s = float(np.std(a))
+    label = "still" if s < 0.03 else ("slight" if s < 0.12 else "moving")
+    return {"level": round(s, 3), "label": label}
+
+
 def current_segment() -> dict:
     """What the recorder is writing right now — the growing raw .txt if a segment
     is live, else the most recent decoded CSV."""
@@ -256,6 +330,8 @@ def frame() -> dict:
         "bands": {ch: bandpower(arr, i) for i, ch in enumerate(CHANNELS)},
         "segment": current_segment(),
         "battery": COLLECTOR.battery,
+        "pulse": heart_rate(COLLECTOR),
+        "movement": movement(COLLECTOR),
         "traces": traces,
         "display_hz": round(SFREQ / DECIMATE, 1),
     }
@@ -299,6 +375,12 @@ canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px
 .wrap{margin-bottom:.5rem}
 .wrap .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
   margin-bottom:.15rem}
+.vitals{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem}
+.vital{background:#1b2027;border:1px solid var(--line);border-radius:7px;padding:.7rem .8rem}
+.vlbl{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em}
+.vval{font-size:1.8rem;font-weight:600;margin:.1rem 0;font-variant-numeric:tabular-nums}
+.vval .vunit{font-size:.9rem;font-weight:400;color:var(--muted)}
+.vsub{font-size:.74rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .bandgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem}
 .bandcell .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
   margin-bottom:.35rem}
@@ -311,11 +393,21 @@ canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px
   <h1>MUSE · LIVE</h1>
   <span id="conn" class="stat"><span class="dot dead"></span>connecting…</span>
   <span id="batt" class="stat batt">🔋 <b>—</b></span>
+  <span id="pulse" class="stat">❤️ <b>—</b></span>
   <span id="rate" class="stat"></span>
   <span id="seg" class="stat"></span>
 </header>
 <main>
   <div id="battwarn" class="battwarn"></div>
+  <div class="panel"><h2>Pulse &amp; movement <span class="stat" style="text-transform:none">from optics + IMU</span></h2>
+    <div class="vitals">
+      <div class="vital"><div class="vlbl">Heart rate</div>
+        <div class="vval"><span id="hr">—</span><span class="vunit"> bpm</span></div></div>
+      <div class="vital"><div class="vlbl">Movement</div>
+        <div class="vval"><span id="mv">—</span></div>
+        <div class="vsub" id="mvsub"></div></div>
+    </div>
+  </div>
   <div class="panel"><h2>Electrode contact</h2><div id="q" class="chgrid"></div></div>
   <div class="panel"><h2>Live signal <span id="hz" class="stat"></span></h2><div id="waves"></div></div>
   <div class="panel"><h2>Band power · all sensors</h2><div id="bandgrid" class="bandgrid"></div></div>
@@ -379,6 +471,13 @@ es.onmessage=e=>{
         'the link starts dropping through the night.';}
     else{bw.className='battwarn';}
   }
+  // Pulse (from PPG/optics) + movement (from the accelerometer).
+  const pb=document.getElementById('pulse').querySelector('b');
+  pb.textContent = d.pulse!=null ? d.pulse+' bpm' : '—';
+  document.getElementById('hr').textContent = d.pulse!=null ? d.pulse : '—';
+  const mv=d.movement||{level:null,label:'—'};
+  document.getElementById('mv').textContent = mv.label;
+  document.getElementById('mvsub').textContent = mv.level!=null ? ('σ '+mv.level+' g') : '';
   document.getElementById('q').innerHTML=CH.map(c=>{
     const q=d.quality[c]||{verdict:'no data',std:0,railed:0};
     const cls=q.verdict.replace(' ','');
@@ -417,6 +516,10 @@ class Handler(BaseHTTPRequestHandler):
         body = PAGE.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # Never let the browser cache the page: when the page HTML changes (as it
+        # just did, AF7-only -> all sensors), a cached copy runs old JS against
+        # new data and silently breaks — e.g. band-power bars that never fill.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
