@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 USER_NAME="$(id -un)"
 HOME_DIR="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
 VENV="${VENV:-${HOME_DIR}/muse-env}"
-PRESET="${MUSE_PRESET:-p60}"
+PRESET="${MUSE_PRESET:-p1041}"   # no LED-off preset exists on fw 3.1.15 (see README)
 SWITCH=0
 [[ "${1:-}" == "--switch" ]] && SWITCH=1
 
@@ -68,12 +68,18 @@ fi
 
 # ------------------------------------------------------------- provisioning --
 bold "OpenMuse (into ${VENV})"
-# VALIDATE: confirm the install source. Try PyPI, fall back to the GitHub repo.
 if "${VENV}/bin/python" -c "import OpenMuse" 2>/dev/null; then
     ok "OpenMuse already importable"
 else
-    "${VENV}/bin/pip" install --quiet OpenMuse 2>/dev/null \
-      || "${VENV}/bin/pip" install --quiet "git+https://github.com/DominiqueMakowski/OpenMuse" \
+    # System deps OpenMuse needs (confirmed 2026-09-09 on Pi 5 / Debian 13):
+    # git to install; fontconfig for its font stack; GL ES libs because it
+    # imports vispy (a GPU visualiser) even for headless recording.
+    echo "   installing system dependencies (git, fontconfig, GL ES libs)"
+    sudo apt-get -qq update 2>&1 | tail -1 || true
+    sudo apt-get -qq install -y git fontconfig libfontconfig1 \
+        libgles2 libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri 2>&1 | tail -2 || true
+    # Not on PyPI — install straight from the repo.
+    "${VENV}/bin/pip" install --quiet "git+https://github.com/DominiqueMakowski/OpenMuse" \
       || die "could not install OpenMuse into the venv"
     "${VENV}/bin/python" -c "import OpenMuse" || die "OpenMuse installed but not importable"
     ok "OpenMuse installed"
@@ -140,18 +146,16 @@ fi
 # ------------------------------------------------------------------- next ----
 cat <<NEXT
 
-   Validate BEFORE trusting overnight (device in hand, band charged & on head):
+   Validated on hardware (fw 3.1.15) 2026-09-09: capture works on preset ${PRESET}.
+   Note: NO preset turns the fNIRS LED off on this firmware — the sensor glows all
+   night. Staging is unaffected (optics are dropped); block the sensor physically
+   if the light bothers you.
 
-     ${VENV}/bin/OpenMuse find                       # confirm MAC + discovery format
+   Quick re-check any time (band on head):
      ${VENV}/bin/OpenMuse record --address <MAC> --preset ${PRESET} \\
          --duration 60 --outfile /tmp/athena_test.txt
      ${VENV}/bin/python ${HOME_DIR}/muse_athena_record.py --decode-only /tmp/athena_test.txt
-     column -s, -t < /tmp/athena_test.csv | head          # check columns + values
-
-   Confirm: 4 EEG columns TP9,AF7,AF8,TP10 present; values look like µV (tens–
-   hundreds on-head, ±1000 rails on a table); 'timestamps' are ~unix-epoch secs;
-   the LED is OFF on preset ${PRESET}. If any of that is wrong, fix the VALIDATE
-   points in muse_athena_record.py before switching.
+     column -s, -t < /tmp/athena_test.csv | head    # 4 EEG cols, µV-ish, epoch ts
 
      Logs   journalctl -u muse-athena-record -f
 NEXT

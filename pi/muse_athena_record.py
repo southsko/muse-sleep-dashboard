@@ -74,6 +74,13 @@ STOP_HOUR = os.environ.get("STOP_HOUR", "").strip()       # optional: stop loopi
 FS = 256.0
 EEG_COLS = ["TP9", "AF7", "AF8", "TP10"]
 
+# The OpenMuse console script lives in the venv's bin/ next to this python. The
+# systemd unit runs `<venv>/bin/python muse_athena_record.py` directly (not an
+# activated venv), so the venv bin/ is NOT on PATH and a bare "OpenMuse" isn't
+# found. Resolve it by absolute path; fall back to PATH for a manual run.
+_cli = Path(sys.executable).with_name("OpenMuse")
+OPENMUSE = str(_cli) if _cli.exists() else "OpenMuse"
+
 _stop = False
 
 
@@ -120,7 +127,7 @@ def discover_mac() -> str:
     on the real device — this parse is a best guess at a MAC-looking token."""
     log.info("no MUSE_MAC set — scanning with `OpenMuse find`")
     try:
-        out = _sh(["OpenMuse", "find"]).stdout
+        out = _sh([OPENMUSE, "find"]).stdout
     except FileNotFoundError:
         log.error("OpenMuse not found on PATH — is the venv active?")
         return ""
@@ -156,10 +163,11 @@ def _kill(proc: subprocess.Popen) -> None:
 def record_segment(mac: str, raw_path: Path) -> tuple[float, int]:
     """Returns (seconds_ran, bytes_written). Kills the recorder if the file
     stops growing — OpenMuse, like muselsl, can sit alive after the link dies."""
-    # VALIDATE: confirm OpenMuse accepts these exact flags (--preset, --outfile).
-    # The README shows `--address/--duration/--outfile` and a `--preset` option;
-    # `--record` may also be required to actually write packets. Adjust here.
-    cmd = ["OpenMuse", "record", "--address", mac, "--preset", PRESET,
+    # Flags confirmed on fw 3.1.15: record --address --preset --duration --outfile
+    # (no --record needed). "Device ... was not found" here just means the band
+    # isn't advertising this instant (asleep, or held by the phone app) — the loop
+    # retries and latches when it comes back.
+    cmd = [OPENMUSE, "record", "--address", mac, "--preset", PRESET,
            "--duration", str(SEGMENT_SEC), "--outfile", str(raw_path)]
     log.info("recording: %s", " ".join(cmd))
     try:
