@@ -237,12 +237,21 @@ detail that misled the first pass: an OPTICS *frame* can decode as present-but-
 **empty** on the EEG-only presets — judge by optics **row count/values**, not the
 key. Set via `MUSE_PRESET` in `~/.config/muse/athena.env`.
 
-### Install / cut over from Gen-1
+### Install — Athena is THE recorder
 
-    bash install-athena.sh            # installs + enables (p21), does NOT start; Gen-1 untouched
-    bash install-athena.sh --switch   # stops+disables Gen-1 muse-record, starts Athena
+    bash install-athena.sh                    # install (p21), retire Gen-1, start; enabled on boot
+    MUSE_NO_START=1 bash install-athena.sh    # install but don't start yet
 
-Revert is `systemctl disable --now muse-athena-record && systemctl enable --now muse-record`.
+The Athena **replaces** the Gen-1 muselsl recorder. A Muse takes only one
+Bluetooth connection and the Pi has one BLE adapter, so **two recorders running
+at once fight over the radio and the link flaps connected/disconnected all
+night** — the failure this setup is built to avoid. The installer therefore
+retires Gen-1 (stops, disables, renames its unit aside), and the Athena unit
+declares `Conflicts=muse-record.service` as a hard guarantee that the two can
+never be active together. On boot, only the Athena recorder starts.
+
+Revert to Gen-1 is deliberate: rename `muse-record.service.retired-*` back,
+`systemctl disable --now muse-athena-record`, `systemctl enable --now muse-record`.
 Quick re-check with the band on: `OpenMuse record … --duration 60 …` then
 `muse_athena_record.py --decode-only …` and eyeball the CSV.
 

@@ -1,16 +1,21 @@
 #!/bin/bash
-# Install the Muse S Athena recorder (OpenMuse) alongside the existing Gen-1
-# recorder, WITHOUT disturbing it. Run on the Pi, from the copied pi/ directory:
+# Install the Muse S Athena recorder (OpenMuse) as THE recorder on the Pi. Run on
+# the Pi, from the copied pi/ directory:
 #
-#     bash install-athena.sh                 # install, leave Gen-1 running
+#     bash install-athena.sh
 #     MUSE_MAC=00:11:22:33:44:55 bash install-athena.sh
-#     bash install-athena.sh --switch        # ALSO stop Gen-1 and start Athena
+#     MUSE_NO_START=1 bash install-athena.sh    # install but don't start yet
 #
-# By default the Athena service is installed and enabled but NOT started, and the
-# Gen-1 muse-record service is left exactly as it is. You switch over on purpose,
-# once a 60-second test recording has validated the decode (see pi/README.md).
+# The Athena (OpenMuse) recorder REPLACES the Gen-1 muselsl recorder. Validated
+# on hardware 2026-09-09 (fw 3.1.15). Because a Muse takes only one Bluetooth
+# connection and the Pi has one BLE adapter, running both recorders makes them
+# fight over the adapter and the link flaps all night — so this installer RETIRES
+# the Gen-1 recorder (disables it, renames its unit aside) rather than leaving a
+# second recorder that can contend for the radio. The Athena unit also declares
+# `Conflicts=muse-record.service` as a hard belt-and-suspenders guarantee.
 #
-# Idempotent — safe to re-run.
+# Idempotent — safe to re-run. Reverting to Gen-1 is deliberate and manual
+# (rename the retired unit back, disable muse-athena-record).
 
 set -euo pipefail
 
@@ -19,8 +24,8 @@ USER_NAME="$(id -un)"
 HOME_DIR="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
 VENV="${VENV:-${HOME_DIR}/muse-env}"
 PRESET="${MUSE_PRESET:-p21}"     # EEG4, optics/LED OFF — low power for overnight (see README)
-SWITCH=0
-[[ "${1:-}" == "--switch" ]] && SWITCH=1
+NO_START=0
+[[ "${MUSE_NO_START:-}" == "1" || "${1:-}" == "--no-start" ]] && NO_START=1
 
 bold() { printf '\n\033[1;36m━━ %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; }
@@ -124,23 +129,35 @@ sudo install -m 0644 "${UNIT_TMP}" /etc/systemd/system/muse-athena-record.servic
 rm -f "${UNIT_TMP}"
 sudo systemctl daemon-reload
 sudo systemctl enable muse-athena-record >/dev/null 2>&1 || true
-ok "installed and enabled muse-athena-record.service (not started)"
+ok "installed and enabled muse-athena-record.service"
 
-# --------------------------------------------------------------- switchover --
-if [[ "${SWITCH}" -eq 1 ]]; then
-    bold "Switching from Gen-1 to Athena"
-    if systemctl list-unit-files | grep -q '^muse-record\.service'; then
-        sudo systemctl disable --now muse-record 2>/dev/null || true
-        ok "stopped and disabled Gen-1 muse-record"
-    fi
-    sudo systemctl start muse-athena-record
+# ----------------------------------------------------------- retire Gen-1 --
+# The Athena replaces the Gen-1 recorder. Leaving muse-record enabled means two
+# recorders contend for the one BLE adapter and the link flaps all night (the
+# exact failure this fixes). Retire it: stop, disable, and rename the unit aside
+# so systemd no longer sees it and nothing can start it by accident.
+bold "Retiring the Gen-1 recorder"
+GEN1=/etc/systemd/system/muse-record.service
+if systemctl list-unit-files 2>/dev/null | grep -q '^muse-record\.service' || [[ -f "${GEN1}" ]]; then
+    sudo systemctl disable --now muse-record 2>/dev/null || true
+    [[ -f "${GEN1}" ]] && sudo mv "${GEN1}" "${GEN1}.retired-$(date +%Y%m%d)"
+    sudo systemctl daemon-reload
+    ok "Gen-1 muse-record stopped, disabled, and retired"
+else
+    ok "no Gen-1 recorder present"
+fi
+
+# ------------------------------------------------------------------ start --
+if [[ "${NO_START}" -eq 1 ]]; then
+    warn "install complete; NOT started (MUSE_NO_START). Start when ready:"
+    echo "       sudo systemctl start muse-athena-record"
+else
+    bold "Starting the Athena recorder"
+    sudo systemctl restart muse-athena-record
     sleep 3
     systemctl is-active --quiet muse-athena-record \
-        && ok "muse-athena-record is running" \
+        && ok "muse-athena-record is running (starts automatically on every boot)" \
         || warn "muse-athena-record did not start — journalctl -u muse-athena-record -e"
-else
-    warn "Gen-1 muse-record left untouched. Validate first, then switch:"
-    echo "       bash install-athena.sh --switch"
 fi
 
 # ------------------------------------------------------------------- next ----

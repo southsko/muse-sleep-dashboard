@@ -3,6 +3,11 @@ Description=Muse S Athena overnight EEG capture (OpenMuse)
 # BLE needs the adapter up; nothing here needs the network.
 After=bluetooth.target
 Wants=bluetooth.target
+# A Muse accepts exactly ONE Bluetooth connection, and the Pi has ONE BLE
+# adapter. If the retired Gen-1 recorder (muselsl) is ever running too, the two
+# fight over the adapter and the link flaps connected/disconnected all night.
+# This makes the two mutually exclusive: starting Athena stops muse-record.
+Conflicts=muse-record.service
 
 [Service]
 Type=simple
