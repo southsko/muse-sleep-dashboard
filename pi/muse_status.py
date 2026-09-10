@@ -138,7 +138,11 @@ class Collector:
                 if new:
                     self._last_ts = new[-1].split("\t", 1)[0]
                     self._ingest(OpenMuse.decode_rawdata(new), pd)
-                if time.time() - self.last_sample_at > 4:
+                # Stale only after 6 s of no new data — longer than the gap
+                # between OpenMuse's flush bursts, so a steady link never trips it.
+                # A real dead link stops the file growing and this still fires well
+                # before the recorder's own ~100 s stall/rollover.
+                if time.time() - self.last_sample_at > 6:
                     self.connected = False
                 time.sleep(POLL_SEC)
             except Exception:
@@ -193,12 +197,19 @@ class Collector:
             return np.asarray(self.buf, dtype=float)
 
     def data_rate(self) -> float:
-        """Samples per second over the last couple of seconds."""
+        """Samples per second, averaged over a window WIDE enough to span several
+        of OpenMuse's file-flush bursts. A 2 s window saw zero new lines between
+        flushes and reported 0 Hz, which made the page flap connected/disconnected
+        on a perfectly steady link. 6 s always spans multiple flushes."""
         now = time.time()
         with self.lock:
-            pts = [(t, n) for t, n in self._recent if now - t < 2.0]
+            pts = [(t, n) for t, n in self._recent if now - t < 6.0]
+            newest = self.last_sample_at
         if len(pts) < 2:
-            return 0.0
+            # Too few flushes in the window to divide, but if data landed very
+            # recently the link is clearly alive — report the nominal rate rather
+            # than a misleading 0 that would blink the page to "no data".
+            return SFREQ if (now - newest) < 3.0 else 0.0
         span = pts[-1][0] - pts[0][0]
         return (sum(n for _, n in pts[1:]) / span) if span > 0 else 0.0
 
@@ -313,9 +324,11 @@ COLLECTOR = Collector()
 def frame() -> dict:
     arr = COLLECTOR.snapshot()
     rate = COLLECTOR.data_rate()
-    # Treat "connected" as data actually arriving, not merely a file existing:
-    # a stalled link leaves the raw file present but not growing.
-    live = COLLECTOR.connected and rate > 50
+    # "connected" = data actually arriving (COLLECTOR.connected is the 6 s
+    # staleness flag). Do NOT also gate on rate>50: between OpenMuse's bursty file
+    # flushes the instantaneous rate briefly reads 0 on a perfectly live link, and
+    # gating on it is exactly what made the page flap connected/disconnected.
+    live = COLLECTOR.connected
     traces = {}
     if len(arr):
         tail = arr[-int(BUFFER_SEC * SFREQ):][::DECIMATE]
