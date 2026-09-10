@@ -54,7 +54,9 @@ POLL_SEC = float(os.environ.get("POLL_SEC", "0.15"))
 BUFFER_SEC = 12.0                  # rolling window kept in memory
 DISPLAY_HZ = 51.2                  # decimated rate sent to the browser
 DECIMATE = int(SFREQ / DISPLAY_HZ)  # 5 -> 51.2 Hz, plenty for a visual trace
-FRAME_HZ = 20                      # SSE frames per second
+FRAME_HZ = 10                      # SSE frames per second (data updates ~7 Hz;
+#                                    20 fps of full traces was heavy on mobile and
+#                                    dropped the SSE connection — 10 is plenty)
 QUALITY_SEC = 2.0                  # window for contact quality
 BAND_SEC = 4.0                     # window for band power
 
@@ -384,7 +386,7 @@ main{padding:1rem;max-width:1100px;margin:0 auto}
   border-radius:8px;padding:.6rem .8rem;margin-bottom:1rem;font-size:.86rem;display:none}
 .battwarn.show{display:block}
 .noisy{color:var(--warn)}.nodata{color:var(--bad)}
-canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px}
+canvas{width:100%;height:56px;display:block;background:#12151a;border-radius:6px}
 .wrap{margin-bottom:.5rem}
 .wrap .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
   margin-bottom:.15rem}
@@ -401,6 +403,23 @@ canvas{width:100%;height:90px;display:block;background:#12151a;border-radius:6px
 .bar{background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;transition:height .2s}
 .blbl{display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-top:.3rem;
   font-size:.66rem;color:var(--muted);text-align:center}
+
+/* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
+@media(max-width:640px){
+  header{padding:.6rem .8rem;gap:.5rem .7rem}
+  h1{font-size:.8rem;width:100%}
+  .stat{font-size:.9rem}
+  main{padding:.6rem}
+  .panel{padding:.7rem .75rem;margin-bottom:.7rem}
+  .panel h2{font-size:.68rem;margin-bottom:.55rem}
+  .wrap{margin-bottom:.35rem}
+  .chgrid{grid-template-columns:1fr 1fr;gap:.5rem}
+  .ch .v{font-size:1rem}
+  .vitals{grid-template-columns:1fr 1fr}
+  .vval{font-size:1.5rem}
+  .bandgrid{grid-template-columns:1fr 1fr;gap:.7rem}
+  .bars{height:56px}
+}
 </style></head><body>
 <header>
   <h1>MUSE · LIVE</h1>
@@ -442,9 +461,14 @@ CH.forEach(c=>{const d=document.createElement('div');d.className='bandcell';
     '<div class="blbl">'+BANDS.map(b=>'<div>'+b+'</div>').join('')+'</div>';
   bg.appendChild(d);});
 
+const CH_H=56;  // fixed waveform height (px). Must equal the canvas CSS height.
 function draw(cv,data){
-  const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
-  if(cv.width!==w*dpr){cv.width=w*dpr;cv.height=h*dpr;}
+  // Size the backing buffer from a CONSTANT height, never from the element's own
+  // clientHeight — reading clientHeight back after setting cv.height fed a runaway
+  // loop on high-DPR phones (the canvas grew to fill the screen, huge empty boxes).
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth||300, h=CH_H;
+  if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){
+    cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);}
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
   x.clearRect(0,0,w,h);
   if(!data||!data.length)return;
