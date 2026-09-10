@@ -292,12 +292,58 @@ def _past_stop_hour() -> bool:
         return False
 
 
+def _recover_orphans() -> None:
+    """Re-decode any raw .txt that has no matching CSV — a segment whose in-loop
+    decode failed (kept, not deleted), or a raw left behind by a crash/reboot
+    mid-decode. This makes the by-hand recovery automatic: a stranded segment is
+    swept up on the next pass instead of silently sitting there until someone runs
+    a recovery script.
+
+    Skips a raw still being written (recent mtime) so it never touches the segment
+    currently recording. A raw that still won't decode is set aside as .txt.failed
+    so it is preserved for inspection but not retried forever.
+    """
+    import re
+    for raw in sorted(RAWDIR.glob("*.txt")):
+        csv = OUTDIR / f"{raw.stem}.csv"
+        if csv.exists():
+            continue
+        try:
+            if time.time() - raw.stat().st_mtime < 45:   # still being written
+                continue
+        except OSError:
+            continue
+        m = re.search(r"(\d{8})_(\d{6})", raw.stem)
+        if not m:
+            continue
+        try:
+            start_epoch = datetime.strptime(
+                m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp()
+            n = decode_txt_to_csv(raw, csv, start_epoch)
+        except Exception as exc:
+            log.warning("orphan %s could not be decoded, setting aside: %s",
+                        raw.name, exc)
+            csv.unlink(missing_ok=True)
+            raw.rename(raw.with_suffix(".txt.failed"))
+            continue
+        if n > 0:
+            log.info("recovered orphan %s: %d samples (~%.0f min)",
+                     raw.name, n, n / FS / 60)
+            if not KEEP_RAW:
+                raw.unlink(missing_ok=True)
+        else:
+            csv.unlink(missing_ok=True)
+            raw.rename(raw.with_suffix(".txt.failed"))
+
+
 def main_loop() -> int:
     global MAC
     OUTDIR.mkdir(parents=True, exist_ok=True)
     RAWDIR.mkdir(parents=True, exist_ok=True)
+    _recover_orphans()   # sweep up anything a prior run left undecoded
 
     while not _stop:
+        _recover_orphans()   # and again each cycle (cheap when there's nothing to do)
         if not reset_bt():
             time.sleep(RETRY_SEC)
             continue
