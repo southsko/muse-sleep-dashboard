@@ -39,6 +39,56 @@
 </div>
 {% endif %}
 
+{% if n.status == 'ok' %}
+<style>
+  ol.steps{margin:.2rem 0 0;padding-left:1.2rem}
+  ol.steps li{margin:.55rem 0;font-size:.86rem;line-height:1.5}
+  ol.steps li strong{color:var(--fg)}
+</style>
+<div class="panel">
+  <h2>How this night was processed</h2>
+  <ol class="steps">
+    {% if n.n_segments and n.n_segments > 1 %}
+    <li><strong>Assembled from {{ n.n_segments }} recording segments.</strong>
+      The night is recorded in pieces — the Bluetooth link rolls a fresh segment
+      each hour and after any dropout — and they were stitched back into one
+      continuous night{% if n.gap_minutes and n.gap_minutes > 0.5 %}. The
+      {{ '%.0f'|format(n.gap_minutes) }} min of gaps between segments are left
+      <em>unscored</em> rather than guessed at{% endif %}.</li>
+    {% endif %}
+    {% if n.wear_minutes and n.duration_minutes and n.wear_minutes < n.duration_minutes - 1 %}
+    <li><strong>Trimmed to the worn window.</strong>
+      Of {{ n.duration_minutes|dur }} recorded, only the {{ n.wear_minutes|dur }}
+      the band was actually on your head was scored{% if n.wear_start_min and n.wear_start_min > 1 %};
+      the first {{ '%.0f'|format(n.wear_start_min) }} min, before it was seated,
+      were dropped{% endif %}.</li>
+    {% endif %}
+    {% if n.staging_channel and '-' in n.staging_channel %}
+    <li><strong>Re-derived the montage the scorer needs.</strong>
+      Staged on a bipolar frontal-to-ear derivation
+      (<span class="mono">{{ n.staging_channel }}</span>). Muse references its
+      forehead sensors to a point centimetres away, which the auto-scorer reads as
+      mostly wake; subtracting the ear electrode recreates the long
+      frontal-to-mastoid montage YASA was trained on, recovering real sleep and
+      deep sleep.</li>
+    {% endif %}
+    {% set bad = channels | rejectattr('verdict', 'equalto', 'usable') | map(attribute='name') | list %}
+    {% if bad %}
+    <li><strong>Worked around lost electrode contact.</strong>
+      {{ bad | join(', ') }} lost good contact during the night (expected — the ear
+      pads shift in your sleep); staging leaned on the electrodes that held.</li>
+    {% else %}
+    <li><strong>All four electrodes held contact</strong> across the scored window
+      (TP9, AF7, AF8, TP10).</li>
+    {% endif %}
+  </ol>
+  <p class="note">These are the steps that applied to <em>this</em> night. Every
+  night runs the same pipeline automatically — recorded and decoded on the Pi
+  (self-healing any segment whose decode fails), then merged and staged on the
+  server.</p>
+</div>
+{% endif %}
+
 {# Full width, not side-by-side: these are wide time-series rendered at 13in,
    and halving them makes the axis labels unreadable. #}
 {% if assets.proba %}
