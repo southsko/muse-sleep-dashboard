@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Batch sleep-staging for overnight Muse S recordings made by muselsl.
+"""Batch sleep-staging for overnight Muse S Athena recordings.
 
-Reads muselsl CSVs, filters them, exports EDF, runs YASA sleep staging on a
-frontal channel, and writes hypnograms + probability plots + statistics.
+Reads the recorder's CSVs (timestamps + 4 EEG channels, µV), filters them,
+exports EDF, runs YASA sleep staging on a bipolar frontal-to-ear derivation, and
+writes hypnograms + probability plots + statistics.
 
 Designed to run unattended: one bad recording never takes down the batch.
 """
@@ -54,7 +55,6 @@ SCHEMA_VERSION = 8   # v8: DC-agnostic rail check (Athena rides a ~700µV offset
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
-EXPECTED_COLUMNS = ["timestamps", "TP9", "AF7", "AF8", "TP10", "Right AUX"]
 
 # Channel-health thresholds, applied to the raw signal in microvolts.
 RAIL_UV = 900.0        # |x| beyond this means the amplifier is pinned
@@ -191,7 +191,7 @@ def detect_local_tz(stem: str, first_utc: datetime | None) -> timezone | None:
     delta = local - first_utc.replace(tzinfo=None)
     # Round to the nearest 15 min — covers every real-world offset, including
     # the half-hour and 45-min zones, and absorbs the seconds of clock skew
-    # between "muselsl started" (filename) and the first sample's timestamp.
+    # between when recording started (filename) and the first sample's timestamp.
     quarters = round(delta.total_seconds() / 900)
     if abs(quarters) > 56:               # > ±14 h is not a real timezone
         return None
@@ -201,12 +201,11 @@ def detect_local_tz(stem: str, first_utc: datetime | None) -> timezone | None:
 def load_csv(path: Path) -> tuple[pd.DataFrame, datetime | None, float | None]:
     """Read a recording CSV and return (eeg_uv, start_datetime, measured_sfreq).
 
-    Reads ONLY the timestamp + 4 EEG columns, never the whole file. A recording
-    can carry extra columns (muselsl's Right AUX; a future optics dump) and every
-    segment of a night is held in memory at once before assembly — loading all
-    columns as float64 was the analyzer's memory peak and a path to OOM. EEG is
-    downcast to float32 (µV needs nothing more); the timestamp stays float64
-    because epoch-second precision does not survive float32.
+    Reads ONLY the timestamp + 4 EEG columns, never the whole file. Every segment
+    of a night is held in memory at once before assembly, so loading all columns
+    as float64 was the analyzer's memory peak and a path to OOM. EEG is downcast
+    to float32 (µV needs nothing more); the timestamp stays float64 because
+    epoch-second precision does not survive float32.
     """
     want = {"timestamps", *EEG_CHANNELS}
     df = pd.read_csv(path, usecols=lambda c: c in want)
@@ -222,15 +221,14 @@ def load_csv(path: Path) -> tuple[pd.DataFrame, datetime | None, float | None]:
     if "timestamps" in df.columns:
         ts = pd.to_numeric(df["timestamps"], errors="coerce").dropna().to_numpy()
         if ts.size >= 2:
-            # muselsl writes unix epoch seconds.
+            # Timestamps are unix epoch seconds.
             try:
                 start_dt = datetime.fromtimestamp(float(ts[0]), tz=timezone.utc)
             except (OverflowError, OSError, ValueError):
                 start_dt = None
-            # Measure from the total span, not the median inter-sample delta.
-            # muselsl writes timestamps at millisecond precision, and
-            # 1/256 = 0.0039 s rounds to 0.004 or 0.003 — so the median delta
-            # is 0.004 and implies a bogus 250 Hz on a perfectly good file.
+            # Measure from the total span, not the median inter-sample delta:
+            # at millisecond precision 1/256 = 0.0039 s rounds to 0.004 or 0.003,
+            # so the median delta is 0.004 and implies a bogus 250 Hz on a good file.
             span = float(ts[-1] - ts[0])
             if span > 0:
                 measured = float((ts.size - 1) / span)
@@ -257,12 +255,7 @@ def csv_time_range(path: Path) -> tuple[datetime, datetime] | None:
             size = path.stat().st_size
             fh.seek(max(0, size - 4096))
             tail = fh.read().decode("utf-8", "replace").strip().splitlines()
-        # A valid data line is timestamps + the EEG channels. The old muselsl CSV
-        # also carried a Right AUX column (6 fields, 5 commas); the Athena CSV has
-        # only the 4 EEG channels (5 fields, 4 commas). Requiring >=5 commas
-        # rejected every Athena line, so csv_time_range returned None and no
-        # multi-segment Athena night could ever merge — it fragmented into hourly
-        # pieces, each staged in isolation (worse than the assembled night).
+        # A valid data line is timestamps + the EEG channels: 5 fields, 4 commas.
         min_commas = len(EEG_CHANNELS)   # timestamps + N channels => N commas
         last = next((ln for ln in reversed(tail) if ln.count(",") >= min_commas), None)
         if last is None:
@@ -1214,8 +1207,8 @@ def run_batch(input_dir: Path, out_root: Path, force: bool = False) -> list[Resu
             log.warning("no CSV files found in %s (directory is not empty)", input_dir)
         return []
 
-    # Drop anything still being written before grouping. muselsl appends as it
-    # goes, so an in-progress file looks perfectly valid — analysing it would
+    # Drop anything still being written before grouping. A segment is written as
+    # it goes, so an in-progress file looks perfectly valid — analysing it would
     # produce a partial night AND poison the skip check, so the finished
     # recording would later be passed over as "already processed".
     ready = []
@@ -1331,7 +1324,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input", nargs="?",
                     default=os.environ.get("INPUT_DIR", "/data/recordings"),
-                    help="directory of muselsl CSVs (or a single .csv file)")
+                    help="directory of recording CSVs (or a single .csv file)")
     ap.add_argument("-o", "--output",
                     default=os.environ.get("OUTPUT_DIR", "/data/output"),
                     help="where results are written")

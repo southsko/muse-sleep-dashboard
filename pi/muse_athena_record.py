@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
 """Muse S Athena overnight capture + decode, via OpenMuse.
 
-VALIDATE-WHEN-IT-LANDS. This is a scaffold written before the Athena was in
-hand. Everything marked `# VALIDATE` is an assumption from the brief or the
-OpenMuse README that MUST be confirmed against a real 60-second recording before
-it is trusted (see pi/README.md → "Bringing the Athena online"). The structure —
-supervision loop, Bluetooth recovery, decode → clean CSV — is settled; the exact
-OpenMuse CLI flags, preset, decoded column names, and signal units are not.
-
-Why Python (not the Gen-1 shell recorder): OpenMuse `record` writes *raw BLE
-packets* to a .txt file, not a ready CSV. The samples only exist after a Python
-decode step (`OpenMuse.decode_rawdata`), so capture and decode live together.
+OpenMuse `record` writes *raw BLE packets* to a .txt file, not a ready CSV — the
+samples only exist after a Python decode step (`OpenMuse.decode_rawdata`), so
+capture and decode live together here.
 
 Flow per segment:
     OpenMuse record --address <MAC> --preset <p> --duration <s> --outfile raw.txt
-    -> watchdog the .txt for growth (liveness, exactly like the Gen-1 recorder)
+    -> watchdog the .txt for growth (file growing = the link is alive)
     -> decode raw.txt to a clean CSV in ~/recordings/ that the server-side
-       analyzer already accepts:  timestamps, TP9, AF7, AF8, TP10  (µV, epoch s)
+       analyzer accepts:  timestamps, TP9, AF7, AF8, TP10  (µV, epoch seconds)
 
-The analyzer only requires those four EEG columns plus a `timestamps` column in
-unix epoch seconds; it needs no AUX. Timezone auto-detection on the server side
-depends on two things this script must get right:
+Timezone auto-detection on the server depends on two things this script must get
+right:
   * the CSV `timestamps` are UTC unix-epoch seconds, and
   * the filename `overnight_YYYYMMDD_HHMMSS.csv` is LOCAL wall-clock time.
 The difference between the two is what the server uses to infer the recorder's
 timezone, so do not "fix" either to match the other.
-
-Does NOT touch the running Gen-1 muselsl recorder. Installed disabled; you switch
-over deliberately (see install-athena.sh --switch).
 """
 
 from __future__ import annotations
@@ -64,7 +53,7 @@ MAC = os.environ.get("MUSE_MAC", "").strip()
 # EMPTY on the EEG-only presets — judge by optics ROW COUNT/values, not the key.
 PRESET = os.environ.get("MUSE_PRESET", "p21")
 
-SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly, like Gen 1
+SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly segments
 STALL_SEC = int(os.environ.get("STALL_SEC", "90"))        # no growth => dead link
 POLL_SEC = int(os.environ.get("POLL_SEC", "20"))
 RETRY_SEC = int(os.environ.get("RETRY_SEC", "10"))
@@ -92,9 +81,9 @@ def _on_term(signum, frame):
 
 
 # ---------------------------------------------------------------------------
-# Bluetooth adapter recovery (ported from the Gen-1 muse-autorecord.sh, which
-# was hard-won: the Pi's UART BLE wedges, and a bare reset can leave it DOWN so
-# every later connect fails forever — always verify it comes back up).
+# Bluetooth adapter recovery. Hard-won: the Pi's UART BLE wedges, and a bare
+# reset can leave it DOWN so every later connect fails forever — so always
+# verify it comes back up.
 # ---------------------------------------------------------------------------
 def _sh(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -163,7 +152,7 @@ def _kill(proc: subprocess.Popen) -> None:
 
 def record_segment(mac: str, raw_path: Path) -> tuple[float, int]:
     """Returns (seconds_ran, bytes_written). Kills the recorder if the file
-    stops growing — OpenMuse, like muselsl, can sit alive after the link dies."""
+    stops growing — OpenMuse can sit alive after the link dies."""
     # Flags confirmed on fw 3.1.15: record --address --preset --duration --outfile
     # (no --record needed). "Device ... was not found" here just means the band
     # isn't advertising this instant (asleep, or held by the phone app) — the loop

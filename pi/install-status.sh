@@ -3,7 +3,7 @@
 #
 # Run ON THE PI:  bash install-status.sh
 #
-# Deliberately a SEPARATE unit from muse-record, with hard resource limits. The
+# Deliberately a SEPARATE unit from muse-athena-record, with hard resource limits. The
 # recorder is the fragile, valuable thing; this page is a convenience and must
 # never be able to starve or destabilise it.
 
@@ -36,7 +36,7 @@ sudo tee /etc/systemd/system/muse-status.service >/dev/null <<UNIT
 [Unit]
 Description=Muse live status page
 After=network-online.target
-# Intentionally NOT Requires=muse-record: the page must be reachable even when
+# Intentionally NOT Requires=muse-athena-record: the page must be reachable even when
 # the recorder is down — that is exactly when you want to look at it.
 
 [Service]

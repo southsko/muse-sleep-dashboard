@@ -1,12 +1,13 @@
 # Muse S Sleep Dashboard
 
-Turn overnight [Muse S](https://choosemuse.com/) EEG recordings into sleep staging and a
-browsable web dashboard, self-hosted on your LAN.
+Turn overnight [Muse S Athena](https://choosemuse.com/) EEG recordings into sleep staging
+and a browsable web dashboard, self-hosted on your LAN.
 
 Two machines:
 
-- A **Raspberry Pi** wears the recording job: it streams the headband over Bluetooth
-  (`muselsl`) and serves the raw recordings over SMB. See [`pi/`](pi/).
+- A **Raspberry Pi** wears the recording job: it records the headband over Bluetooth
+  (via [OpenMuse](https://github.com/DominiqueMakowski/OpenMuse)) and serves the raw
+  recordings over SMB. See [`pi/`](pi/).
 - A **server** (built for Unraid + Docker, but any Docker host works) mounts that share,
   runs the analysis, and serves the dashboard.
 
@@ -103,10 +104,10 @@ reprocess automatically without `--force`.
 
 ## What the pipeline does
 
-1. Reads the CSV (`timestamps, TP9, AF7, AF8, TP10, Right AUX`; `Right AUX` discarded).
-   Derives start time from the first timestamp and measures the true sample rate from the
-   **total span** — not the median delta, which reads a bogus 250 Hz because muselsl writes
-   millisecond-precision timestamps and 1/256 s rounds to 0.004.
+1. Reads the CSV (`timestamps, TP9, AF7, AF8, TP10`). Derives start time from the first
+   timestamp and measures the true sample rate from the **total span** — not the median
+   delta, which reads a bogus 250 Hz because timestamps are millisecond-precision and
+   1/256 s rounds to 0.004.
 2. µV → V, MNE Raw, `standard_1020` montage, bandpass 0.5–40 Hz.
 3. Exports EDF of the **whole** recording with `physical_range="channelwise"` — with the
    default, railed ±1000 µV ear channels set the range for every channel and crush the

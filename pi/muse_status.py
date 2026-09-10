@@ -8,9 +8,7 @@ EEG, contact quality, per-channel band power, and battery.
 
 Why tail the file instead of a second Bluetooth connection: the Muse accepts
 exactly ONE BLE link, and the recorder holds it. Reading the file the recorder is
-already writing costs nothing on the radio and cannot perturb or stop the night —
-the same safety the Gen-1 LSL-inlet page had, without needing an LSL stream that
-OpenMuse's file recorder doesn't produce.
+already writing costs nothing on the radio and cannot perturb or stop the night.
 
 Reads only the TAIL of the raw file (never the whole thing, which is hundreds of
 MB by morning), so memory stays flat regardless of how long the night runs.

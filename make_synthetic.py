@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate fake muselsl CSVs for testing the pipeline.
+"""Generate fake recording CSVs for testing the pipeline.
 
 This exercises code paths, not sleep science. Synthetic data proves the
 pipeline runs and the quality guard fires; it says nothing about whether the
@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 SFREQ = 256
-COLUMNS = ["timestamps", "TP9", "AF7", "AF8", "TP10", "Right AUX"]
+COLUMNS = ["timestamps", "TP9", "AF7", "AF8", "TP10"]   # Athena recorder CSV shape
 
 # Rough band structure per sleep stage: (dominant Hz, amplitude uV)
 STAGE_BANDS = {
@@ -80,7 +80,6 @@ def write_csv(path: Path, minutes: float, mode: str, seed: int = 0,
 
         data[ch] = sig
 
-    data["Right AUX"] = np.zeros(n)
     pd.DataFrame(data, columns=COLUMNS).to_csv(path, index=False)
     print(f"wrote {path}  ({minutes:.0f} min, mode={mode}, {path.stat().st_size/1e6:.1f} MB)")
 

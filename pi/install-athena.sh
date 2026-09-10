@@ -1,21 +1,14 @@
 #!/bin/bash
-# Install the Muse S Athena recorder (OpenMuse) as THE recorder on the Pi. Run on
-# the Pi, from the copied pi/ directory:
+# Install the Muse S Athena recorder (OpenMuse) on the Pi. install.sh calls this,
+# or run it directly from the copied pi/ directory:
 #
 #     bash install-athena.sh
 #     MUSE_MAC=00:11:22:33:44:55 bash install-athena.sh
 #     MUSE_NO_START=1 bash install-athena.sh    # install but don't start yet
 #
-# The Athena (OpenMuse) recorder REPLACES the Gen-1 muselsl recorder. Validated
-# on hardware 2026-09-09 (fw 3.1.15). Because a Muse takes only one Bluetooth
-# connection and the Pi has one BLE adapter, running both recorders makes them
-# fight over the adapter and the link flaps all night — so this installer RETIRES
-# the Gen-1 recorder (disables it, renames its unit aside) rather than leaving a
-# second recorder that can contend for the radio. The Athena unit also declares
-# `Conflicts=muse-record.service` as a hard belt-and-suspenders guarantee.
-#
-# Idempotent — safe to re-run. Reverting to Gen-1 is deliberate and manual
-# (rename the retired unit back, disable muse-athena-record).
+# Installs OpenMuse + its system deps into the venv, the recorder script, its
+# systemd unit, and the Bluetooth sudoers rule. Validated on hardware 2026-09-09
+# (fw 3.1.15). Idempotent — safe to re-run.
 
 set -euo pipefail
 
@@ -130,22 +123,6 @@ rm -f "${UNIT_TMP}"
 sudo systemctl daemon-reload
 sudo systemctl enable muse-athena-record >/dev/null 2>&1 || true
 ok "installed and enabled muse-athena-record.service"
-
-# ----------------------------------------------------------- retire Gen-1 --
-# The Athena replaces the Gen-1 recorder. Leaving muse-record enabled means two
-# recorders contend for the one BLE adapter and the link flaps all night (the
-# exact failure this fixes). Retire it: stop, disable, and rename the unit aside
-# so systemd no longer sees it and nothing can start it by accident.
-bold "Retiring the Gen-1 recorder"
-GEN1=/etc/systemd/system/muse-record.service
-if systemctl list-unit-files 2>/dev/null | grep -q '^muse-record\.service' || [[ -f "${GEN1}" ]]; then
-    sudo systemctl disable --now muse-record 2>/dev/null || true
-    [[ -f "${GEN1}" ]] && sudo mv "${GEN1}" "${GEN1}.retired-$(date +%Y%m%d)"
-    sudo systemctl daemon-reload
-    ok "Gen-1 muse-record stopped, disabled, and retired"
-else
-    ok "no Gen-1 recorder present"
-fi
 
 # ------------------------------------------------------------------ start --
 if [[ "${NO_START}" -eq 1 ]]; then
