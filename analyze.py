@@ -257,7 +257,14 @@ def csv_time_range(path: Path) -> tuple[datetime, datetime] | None:
             size = path.stat().st_size
             fh.seek(max(0, size - 4096))
             tail = fh.read().decode("utf-8", "replace").strip().splitlines()
-        last = next((ln for ln in reversed(tail) if ln.count(",") >= 5), None)
+        # A valid data line is timestamps + the EEG channels. The old muselsl CSV
+        # also carried a Right AUX column (6 fields, 5 commas); the Athena CSV has
+        # only the 4 EEG channels (5 fields, 4 commas). Requiring >=5 commas
+        # rejected every Athena line, so csv_time_range returned None and no
+        # multi-segment Athena night could ever merge — it fragmented into hourly
+        # pieces, each staged in isolation (worse than the assembled night).
+        min_commas = len(EEG_CHANNELS)   # timestamps + N channels => N commas
+        last = next((ln for ln in reversed(tail) if ln.count(",") >= min_commas), None)
         if last is None:
             return None
         t0 = float(first.split(",", 1)[0])

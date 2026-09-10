@@ -206,33 +206,60 @@ def record_segment(mac: str, raw_path: Path) -> tuple[float, int]:
 # ---------------------------------------------------------------------------
 # Decode a raw .txt to the clean CSV the analyzer expects.
 # ---------------------------------------------------------------------------
-def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int:
-    """Decode with OpenMuse and write timestamps,TP9,AF7,AF8,TP10 (µV, epoch s).
+def _decode_eeg_chunked(messages: list, chunk: int = 200):
+    """Decode raw notification lines to one concatenated EEG DataFrame, decoding
+    in small chunks and SKIPPING any chunk OpenMuse cannot decode.
 
-    Robust to a truncated raw file (battery death mid-segment): decode_rawdata
-    parses the readable lines and we write whatever samples came out.
+    Why chunk: OpenMuse's decode_rawdata aborts the ENTIRE file on a single odd
+    packet. The Athena occasionally emits a stray 8-channel EEG packet mid-stream;
+    OpenMuse sizes its array for 4 channels and dies with a shape-broadcast error
+    (decode.py make_timestamps), taking the whole hour with it. That is exactly
+    how the first real overnight decoded to nothing. Chunking limits the loss to
+    the ~100-200 samples in the offending chunk (measured: 3 bad chunks in ~60 min
+    = <2 min lost) instead of the entire night.
+
+    Returns (eeg_dataframe_or_None, n_chunks_skipped).
+    """
+    import OpenMuse
+    import pandas as pd
+    frames, skipped = [], 0
+    for i in range(0, len(messages), chunk):
+        try:
+            d = OpenMuse.decode_rawdata(messages[i:i + chunk])
+        except Exception:
+            skipped += 1
+            continue
+        key = next((k for k in d if str(k).upper().startswith("EEG")), None)
+        if key is not None and len(d[key]):
+            frames.append(d[key])
+    if not frames:
+        return None, skipped
+    return pd.concat(frames, ignore_index=True), skipped
+
+
+def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int:
+    """Decode a raw .txt and write timestamps,TP9,AF7,AF8,TP10 (µV, epoch s).
+
+    Robust to a truncated raw file (battery death mid-segment) AND to the stray
+    undecodable packets OpenMuse chokes on — see _decode_eeg_chunked.
     """
     import numpy as np
     import pandas as pd
-    import OpenMuse
 
     with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
-        messages = f.readlines()
+        messages = [ln for ln in f if ln.strip()]
     if not messages:
         return 0
 
-    data = OpenMuse.decode_rawdata(messages)  # dict of DataFrames
+    eeg, skipped = _decode_eeg_chunked(messages)
+    if eeg is None:
+        raise RuntimeError("no EEG decoded from any chunk of the raw file")
+    if skipped:
+        log.warning("%s: skipped %d undecodable chunk(s) — a few lost samples, "
+                    "not the night", raw_path.name, skipped)
 
-    # VALIDATE: confirm the EEG frame's key. README documents an "ACCGYRO" frame
-    # explicitly; the EEG frame's key is assumed to start with "EEG".
-    eeg_key = next((k for k in data if str(k).upper().startswith("EEG")), None)
-    if eeg_key is None:
-        raise RuntimeError(f"no EEG frame in decoded data; keys={list(data)}")
-    eeg = data[eeg_key]
-
-    # Athena decodes the EEG columns PREFIXED: EEG_TP9, EEG_AF7, EEG_AF8, EEG_TP10
-    # (confirmed on firmware 3.1.15). Normalise by stripping a leading "eeg_" and
-    # spaces so both the prefixed names and bare "TP9"-style names match.
+    # Athena decodes the EEG columns PREFIXED: EEG_TP9, EEG_AF7, EEG_AF8, EEG_TP10.
+    # Normalise by stripping a leading "eeg_" so prefixed and bare names both match.
     def _norm(c: str) -> str:
         return str(c).lower().replace(" ", "").removeprefix("eeg_")
     lut = {_norm(c): c for c in eeg.columns}
@@ -240,38 +267,17 @@ def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int
     if missing:
         raise RuntimeError(f"missing EEG channels {missing}; got {list(eeg.columns)}")
 
-    # Units are microvolts (confirmed): on-head std ~20-200 µV, but with a large
-    # ~700 µV DC offset on every channel. The analyzer bandpasses 0.5-40 Hz for
-    # staging, which removes that offset — but its raw-µV rail check (|x|>900) can
-    # be tripped by the offset alone, so the server side mean-centres before that
-    # check (see analyze.py). Values pass through here unscaled.
+    # Units are microvolts, with a ~700 µV DC offset the server mean-centres away.
     out = pd.DataFrame(
         {w: pd.to_numeric(eeg[lut[w.lower()]], errors="coerce") for w in EEG_COLS}
     )
     n = len(out)
 
-    # Timestamps MUST be UTC unix-epoch seconds (the analyzer, timezone
-    # detection, and night-date all assume this). The decoded "time" column's
-    # units are undocumented, so trust it only when it clearly reads as either
-    # epoch seconds or seconds-from-start; otherwise synthesize from the known
-    # record-start clock at the nominal rate. VALIDATE the branch taken.
-    ts = None
-    tkey = lut.get("time")
-    if tkey is not None:
-        t = pd.to_numeric(eeg[tkey], errors="coerce").to_numpy()
-        finite = np.isfinite(t)
-        if finite.sum() >= 2:
-            t0 = float(np.nanmin(t))
-            if t0 > 1e9:                       # already unix epoch
-                ts = t
-            elif 0.0 <= t0 < 1e6:              # seconds since start
-                ts = start_epoch + (t - t0)
-    if ts is None:
-        log.warning("decoded 'time' unusable/absent — synthesizing epoch stamps "
-                    "at %.0f Hz from record start", FS)
-        ts = start_epoch + np.arange(n) / FS
-
-    out.insert(0, "timestamps", ts)
+    # Synthesize timestamps as a continuous 256 Hz UTC-epoch timeline from the
+    # record-start clock. The per-chunk decode resets each chunk's 'time' column,
+    # so it can't be stitched — but a nominal timeline is correct to within the
+    # handful of samples any skipped chunk drops, which staging does not care about.
+    out.insert(0, "timestamps", start_epoch + np.arange(n) / FS)
     out.to_csv(csv_path, index=False)
     return n
 
