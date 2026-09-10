@@ -386,7 +386,12 @@ main{padding:1rem;max-width:1100px;margin:0 auto}
   border-radius:8px;padding:.6rem .8rem;margin-bottom:1rem;font-size:.86rem;display:none}
 .battwarn.show{display:block}
 .noisy{color:var(--warn)}.nodata{color:var(--bad)}
-canvas{width:100%;height:56px;display:block;background:#12151a;border-radius:6px}
+/* A canvas is a replaced element: some mobile browsers ignore its CSS height and
+   size it from the height attribute (the backing buffer), giving a too-tall box
+   with the trace stranded at the top. Wrapping it in a plain div (which always
+   honours CSS height) and letting the canvas fill that div fixes it for good. */
+.wave{width:100%;height:72px}
+canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px}
 .wrap{margin-bottom:.5rem}
 .wrap .lbl{font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);
   margin-bottom:.15rem}
@@ -451,7 +456,9 @@ const BANDS=["Delta","Theta","Alpha","Sigma","Beta"];
 const wraps=document.getElementById('waves');
 CH.forEach(c=>{const d=document.createElement('div');d.className='wrap';
   d.innerHTML='<div class="lbl">'+c+' <span style="opacity:.6">· '+LBL[c]+'</span></div>';
-  const cv=document.createElement('canvas');d.appendChild(cv);wraps.appendChild(d);canv[c]=cv;});
+  const wv=document.createElement('div');wv.className='wave';
+  const cv=document.createElement('canvas');wv.appendChild(cv);d.appendChild(wv);
+  wraps.appendChild(d);canv[c]=cv;});
 
 // One band-power panel per sensor.
 const bg=document.getElementById('bandgrid');
@@ -461,12 +468,12 @@ CH.forEach(c=>{const d=document.createElement('div');d.className='bandcell';
     '<div class="blbl">'+BANDS.map(b=>'<div>'+b+'</div>').join('')+'</div>';
   bg.appendChild(d);});
 
-const CH_H=56;  // fixed waveform height (px). Must equal the canvas CSS height.
 function draw(cv,data){
-  // Size the backing buffer from a CONSTANT height, never from the element's own
-  // clientHeight — reading clientHeight back after setting cv.height fed a runaway
-  // loop on high-DPR phones (the canvas grew to fill the screen, huge empty boxes).
-  const dpr=window.devicePixelRatio||1, w=cv.clientWidth||300, h=CH_H;
+  // The canvas now fills its .wave wrapper (a div with a real CSS height), so its
+  // clientWidth/Height are stable and the trace fills the whole box — no more
+  // stranded-at-the-top traces or runaway growth.
+  const dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth||300, h=cv.clientHeight||72;
   if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){
     cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);}
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
