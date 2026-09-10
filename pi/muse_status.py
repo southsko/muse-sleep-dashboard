@@ -479,12 +479,16 @@ function draw(cv,data){
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
   x.clearRect(0,0,w,h);
   if(!data||!data.length)return;
-  let mx=0;for(const v of data)mx=Math.max(mx,Math.abs(v));
+  // Muse EEG rides a big DC offset (~700 µV). Subtract each channel's mean so the
+  // trace is CENTRED and fills the box, instead of being pinned to the top by the
+  // offset. Scale by the largest deviation from that mean.
+  let mean=0;for(const v of data)mean+=v;mean/=data.length;
+  let mx=0;for(const v of data)mx=Math.max(mx,Math.abs(v-mean));
   mx=Math.max(mx,20);
   x.strokeStyle='#252b34';x.lineWidth=1;x.beginPath();x.moveTo(0,h/2);x.lineTo(w,h/2);x.stroke();
   x.strokeStyle='#5598e7';x.lineWidth=1.2;x.beginPath();
   for(let i=0;i<data.length;i++){
-    const px=i/(data.length-1)*w, py=h/2-(data[i]/mx)*(h/2-4);
+    const px=i/(data.length-1)*w, py=h/2-((data[i]-mean)/mx)*(h/2-4);
     i?x.lineTo(px,py):x.moveTo(px,py);
   }
   x.stroke();
