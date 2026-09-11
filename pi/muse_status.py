@@ -320,6 +320,11 @@ def current_segment() -> dict:
 
 COLLECTOR = Collector()
 
+try:
+    PAGE_VERSION = str(int(os.path.getmtime(__file__)))
+except OSError:
+    PAGE_VERSION = "0"
+
 
 def frame() -> dict:
     arr = COLLECTOR.snapshot()
@@ -347,6 +352,11 @@ def frame() -> dict:
         "movement": movement(COLLECTOR),
         "traces": traces,
         "display_hz": round(SFREQ / DECIMATE, 1),
+        # Changes whenever this file is redeployed; the page reloads itself when it
+        # sees a version different from the one it loaded with, so a cached/stale
+        # tab (mobile Chrome keeps them alive over SSE) can't keep rendering old
+        # code after a deploy — the exact trap that hid every waveform fix.
+        "v": PAGE_VERSION,
     }
 
 
@@ -492,9 +502,14 @@ function draw(cv,data){
   x.stroke();
 }
 
+let PAGE_V=null;
 const es=new EventSource('/stream');
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
+  // Self-update: if the server was redeployed since this page loaded, reload to
+  // pick up the new code instead of rendering stale cached JS forever.
+  if(PAGE_V===null){PAGE_V=d.v;}
+  else if(d.v && d.v!==PAGE_V){location.reload();return;}
   document.getElementById('conn').innerHTML=
     '<span class="dot '+(d.connected?'live':'dead')+'"></span>'+
     (d.connected?'streaming':'no data');
