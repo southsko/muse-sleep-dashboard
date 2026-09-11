@@ -417,6 +417,13 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 .blbl{display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-top:.3rem;
   font-size:.66rem;color:var(--muted);text-align:center}
 
+.zoom{float:right;font-size:.72rem;color:var(--muted);text-transform:none;letter-spacing:0;
+  display:inline-flex;align-items:center;gap:.3rem}
+.zoom .zg{color:var(--muted)} .zoom .zg b{color:var(--fg);font-variant-numeric:tabular-nums}
+.zoom button{background:var(--panel2,#1b2027);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;width:26px;height:26px;font-size:1rem;line-height:1;cursor:pointer;padding:0}
+.zoom button:active{background:var(--accent);color:#0b1016}
+
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
 @media(max-width:640px){
   header{padding:.6rem .8rem;gap:.5rem .7rem}
@@ -454,7 +461,13 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
     </div>
   </div>
   <div class="panel"><h2>Electrode contact</h2><div id="q" class="chgrid"></div></div>
-  <div class="panel"><h2>Live signal <span id="hz" class="stat"></span></h2><div id="waves"></div></div>
+  <div class="panel"><h2>Live signal <span id="hz" class="stat"></span>
+    <span class="zoom">
+      <span class="zg">amp <b id="zamp">1.0×</b></span>
+      <button data-z="amp-">–</button><button data-z="amp+">+</button>
+      <span class="zg">span <b id="zspan">12s</b></span>
+      <button data-z="time-">–</button><button data-z="time+">+</button>
+    </span></h2><div id="waves"></div></div>
   <div class="panel"><h2>Band power · all sensors</h2><div id="bandgrid" class="bandgrid"></div></div>
 </main>
 <script>
@@ -476,6 +489,24 @@ CH.forEach(c=>{const d=document.createElement('div');d.className='bandcell';
     '<div class="blbl">'+BANDS.map(b=>'<div>'+b+'</div>').join('')+'</div>';
   bg.appendChild(d);});
 
+// Zoom: amp = vertical gain, win = seconds of the 12 s buffer shown (fewer = zoom
+// in on time). Persisted per browser.
+const ZOOM={amp:1,win:12};
+function zLoad(){try{const z=JSON.parse(localStorage.getItem('zoom')||'{}');
+  if(z.amp)ZOOM.amp=z.amp; if(z.win)ZOOM.win=z.win;}catch(e){}}
+function zShow(){document.getElementById('zamp').textContent=ZOOM.amp.toFixed(1)+'×';
+  document.getElementById('zspan').textContent=ZOOM.win+'s';}
+function zSave(){try{localStorage.setItem('zoom',JSON.stringify(ZOOM));}catch(e){}}
+zLoad();zShow();
+document.querySelectorAll('.zoom button').forEach(b=>b.onclick=()=>{
+  const z=b.dataset.z;
+  if(z==='amp+')ZOOM.amp=Math.min(8,ZOOM.amp*1.5);
+  if(z==='amp-')ZOOM.amp=Math.max(0.25,ZOOM.amp/1.5);
+  if(z==='time+')ZOOM.win=Math.min(12,ZOOM.win+2);   // + = more seconds (zoom out)
+  if(z==='time-')ZOOM.win=Math.max(2,ZOOM.win-2);    // – = fewer seconds (zoom in)
+  ZOOM.amp=Math.round(ZOOM.amp*100)/100;zShow();zSave();
+});
+
 function draw(cv,data){
   // The canvas now fills its .wave wrapper (a div with a real CSS height), so its
   // clientWidth/Height are stable and the trace fills the whole box — no more
@@ -487,21 +518,21 @@ function draw(cv,data){
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
   x.clearRect(0,0,w,h);
   if(!data||!data.length)return;
+  // Time zoom: show only the last ZOOM.win seconds of the 12 s buffer.
+  if(ZOOM.win<12){const k=Math.max(2,Math.round(data.length*ZOOM.win/12));data=data.slice(-k);}
   // Muse EEG rides a big DC offset (~700 µV); subtract each channel's mean so the
   // trace is centred. Scale by the TYPICAL excursion (mean absolute deviation),
-  // not the max — the max makes one artifact spike squash the whole trace, and
-  // makes it slam flat against the box edges. ~3.2x MAD ≈ a normal peak; a floor
-  // keeps a quiet channel from having its noise blown up to fill the box.
+  // not the max — the max makes one artifact spike squash the whole trace. ~3.2x
+  // MAD ≈ a normal peak; a floor keeps a quiet channel calm. ZOOM.amp is manual
+  // gain on top; the canvas clips anything the gain pushes past the box edge.
   let mean=0;for(const v of data)mean+=v;mean/=data.length;
   let mad=0;for(const v of data)mad+=Math.abs(v-mean);mad/=data.length;
   const scale=Math.max(mad*3.2,12);
-  const amp=h*0.44;                 // leave ~12% headroom top and bottom
+  const amp=h*0.44*ZOOM.amp;
   x.strokeStyle='#20262f';x.lineWidth=1;x.beginPath();x.moveTo(0,h/2);x.lineTo(w,h/2);x.stroke();
   x.strokeStyle='#5598e7';x.lineWidth=1.1;x.lineJoin='round';x.beginPath();
   for(let i=0;i<data.length;i++){
-    let n=(data[i]-mean)/scale;
-    if(n>1.1)n=1.1; else if(n<-1.1)n=-1.1;   // clamp rare outliers inside the box
-    const px=i/(data.length-1)*w, py=h/2-n*amp;
+    const px=i/(data.length-1)*w, py=h/2-((data[i]-mean)/scale)*amp;
     i?x.lineTo(px,py):x.moveTo(px,py);
   }
   x.stroke();
