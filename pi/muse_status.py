@@ -487,16 +487,21 @@ function draw(cv,data){
   const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
   x.clearRect(0,0,w,h);
   if(!data||!data.length)return;
-  // Muse EEG rides a big DC offset (~700 µV). Subtract each channel's mean so the
-  // trace is CENTRED and fills the box, instead of being pinned to the top by the
-  // offset. Scale by the largest deviation from that mean.
+  // Muse EEG rides a big DC offset (~700 µV); subtract each channel's mean so the
+  // trace is centred. Scale by the TYPICAL excursion (mean absolute deviation),
+  // not the max — the max makes one artifact spike squash the whole trace, and
+  // makes it slam flat against the box edges. ~3.2x MAD ≈ a normal peak; a floor
+  // keeps a quiet channel from having its noise blown up to fill the box.
   let mean=0;for(const v of data)mean+=v;mean/=data.length;
-  let mx=0;for(const v of data)mx=Math.max(mx,Math.abs(v-mean));
-  mx=Math.max(mx,20);
-  x.strokeStyle='#252b34';x.lineWidth=1;x.beginPath();x.moveTo(0,h/2);x.lineTo(w,h/2);x.stroke();
-  x.strokeStyle='#5598e7';x.lineWidth=1.2;x.beginPath();
+  let mad=0;for(const v of data)mad+=Math.abs(v-mean);mad/=data.length;
+  const scale=Math.max(mad*3.2,12);
+  const amp=h*0.44;                 // leave ~12% headroom top and bottom
+  x.strokeStyle='#20262f';x.lineWidth=1;x.beginPath();x.moveTo(0,h/2);x.lineTo(w,h/2);x.stroke();
+  x.strokeStyle='#5598e7';x.lineWidth=1.1;x.lineJoin='round';x.beginPath();
   for(let i=0;i<data.length;i++){
-    const px=i/(data.length-1)*w, py=h/2-((data[i]-mean)/mx)*(h/2-4);
+    let n=(data[i]-mean)/scale;
+    if(n>1.1)n=1.1; else if(n<-1.1)n=-1.1;   // clamp rare outliers inside the box
+    const px=i/(data.length-1)*w, py=h/2-n*amp;
     i?x.lineTo(px,py):x.moveTo(px,py);
   }
   x.stroke();
