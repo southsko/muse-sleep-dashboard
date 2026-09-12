@@ -656,7 +656,7 @@ es.onmessage=e=>{
   const mn=document.getElementById('mains'), m=d.mains||{hz:null,uv:0};
   if(!d.connected||m.hz===null){mn.textContent='—';mn.className='';}
   else{mn.textContent=m.hz+' Hz · '+m.uv+' µV';
-    mn.className = m.uv<10?'good':(m.uv<30?'':'warn');}
+    mn.className = m.uv<20?'good':(m.uv<120?'':'warn');}
   CH.forEach(c=>draw(canv[c],d.traces[c]));
   CH.forEach(c=>{const b=d.bands[c]||{};
     BANDS.forEach((name,i)=>{const el=document.getElementById('bar_'+c+'_'+i);
