@@ -20,6 +20,11 @@ services:
       RUN_AT: "09:00"
       # Also run immediately on container start, so a restart isn't a lost day.
       RUN_ON_START: "1"
+      # Re-scan hourly (not every 4 h): the recorder writes an hourly segment, so
+      # a night grows through the morning. already_done reprocesses a grown night,
+      # so hourly scans keep the dashboard current — a night is complete within
+      # ~1 h of the last segment instead of showing a partial view until 09:00.
+      RESCAN_HOURS: "1"
       # Decides both the nightly run time and which calendar night a recording
       # is filed under. Set this to your own timezone (e.g. America/New_York);
       # ideally the same zone the Pi uses so recording filenames line up.
