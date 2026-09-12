@@ -303,6 +303,40 @@ def movement(c: "Collector") -> dict:
     return {"level": round(s, 3), "label": label}
 
 
+_MAINS = {"val": {"hz": None, "pct": 0.0}, "at": 0.0}
+
+
+def mains(arr: np.ndarray) -> dict:
+    """Mains (power-line) hum: the worst channel's RMS amplitude (µV) at 50 or
+    60 Hz. Reported as µV, not a fraction — the fraction saturates near 100% (the
+    hum dwarfs the tiny EEG), but the amplitude drops as contact/grounding
+    improves, so it's an actionable "seat the band to minimise this" meter.
+    (Idea borrowed from MuseScope.) Cached ~1s. Returns {hz, uv}."""
+    now = time.time()
+    if now - _MAINS["at"] < 1.0:
+        return _MAINS["val"]
+    from scipy.signal import welch
+    n = int(4 * SFREQ)
+    if len(arr) < n // 2:
+        _MAINS["val"], _MAINS["at"] = {"hz": None, "uv": 0.0}, now
+        return _MAINS["val"]
+    worst, whz = 0.0, 60
+    for i in range(arr.shape[1]):
+        x = arr[-n:, i]
+        x = x - np.median(x)
+        f, p = welch(x, fs=SFREQ, nperseg=min(len(x), 512))
+        for hz in (50, 60):
+            band = (f >= hz - 1.5) & (f <= hz + 1.5)
+            if not band.any():
+                continue
+            rms = float(np.trapezoid(p[band], f[band])) ** 0.5   # µV RMS in the notch
+            if rms > worst:
+                worst, whz = rms, hz
+    _MAINS["val"] = {"hz": whz, "uv": round(worst, 1)}
+    _MAINS["at"] = now
+    return _MAINS["val"]
+
+
 def current_segment() -> dict:
     """What the recorder is writing right now — the growing raw .txt if a segment
     is live, else the most recent decoded CSV."""
@@ -350,6 +384,7 @@ def frame() -> dict:
         "battery": COLLECTOR.battery,
         "pulse": heart_rate(COLLECTOR),
         "movement": movement(COLLECTOR),
+        "mains": mains(arr),
         "traces": traces,
         "display_hz": round(SFREQ / DECIMATE, 1),
         # Changes whenever this file is redeployed; the page reloads itself when it
@@ -423,6 +458,16 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 .zoom button{background:var(--panel2,#1b2027);color:var(--fg);border:1px solid var(--line);
   border-radius:5px;width:26px;height:26px;font-size:1rem;line-height:1;cursor:pointer;padding:0}
 .zoom button:active{background:var(--accent);color:#0b1016}
+.contactwrap{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+.head{width:150px;height:158px;flex:0 0 auto}
+.head .el{fill:#5c6673;stroke:#0f1216;stroke-width:2;transition:fill .3s}
+.head .el.good{fill:var(--good)} .head .el.noisy,.head .el.railed{fill:var(--warn)}
+.head .el.flat,.head .el.nodata{fill:#5c6673}
+.head .ell{fill:#0b1016;font:600 11px ui-monospace,monospace;text-anchor:middle}
+.contactwrap #q{flex:1 1 200px}
+.sighealth{display:flex;gap:1.2rem;margin-top:.7rem;font-size:.82rem;color:var(--muted)}
+.sighealth b{font-variant-numeric:tabular-nums} .sighealth b.warn{color:var(--warn)}
+.sighealth b.good{color:var(--good)}
 
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
 @media(max-width:640px){
@@ -460,7 +505,25 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
         <div class="vsub" id="mvsub"></div></div>
     </div>
   </div>
-  <div class="panel"><h2>Electrode contact</h2><div id="q" class="chgrid"></div></div>
+  <div class="panel"><h2>Electrode contact</h2>
+    <div class="contactwrap">
+      <svg class="head" viewBox="0 0 200 210" aria-label="electrode contact map">
+        <polygon points="100,6 90,26 110,26" fill="#2a313c"/>
+        <ellipse cx="18" cy="112" rx="10" ry="18" fill="none" stroke="#2a313c" stroke-width="3"/>
+        <ellipse cx="182" cy="112" rx="10" ry="18" fill="none" stroke="#2a313c" stroke-width="3"/>
+        <circle cx="100" cy="112" r="80" fill="#12151a" stroke="#2a313c" stroke-width="3"/>
+        <circle id="el_AF7" class="el" cx="66" cy="64" r="15"/><text class="ell" x="66" y="68">AF7</text>
+        <circle id="el_AF8" class="el" cx="134" cy="64" r="15"/><text class="ell" x="134" y="68">AF8</text>
+        <circle id="el_TP9" class="el" cx="40" cy="140" r="15"/><text class="ell" x="40" y="144">TP9</text>
+        <circle id="el_TP10" class="el" cx="160" cy="140" r="15"/><text class="ell" x="160" y="144">TP10</text>
+      </svg>
+      <div id="q" class="chgrid"></div>
+    </div>
+    <div class="sighealth">
+      <span>reception <b id="recv">—</b></span>
+      <span>mains hum <b id="mains">—</b></span>
+    </div>
+  </div>
   <div class="panel"><h2>Live signal <span id="hz" class="stat"></span>
     <span class="zoom">
       <span class="zg">amp <b id="zamp">1.0×</b></span>
@@ -578,10 +641,22 @@ es.onmessage=e=>{
   document.getElementById('q').innerHTML=CH.map(c=>{
     const q=d.quality[c]||{verdict:'no data',std:0,railed:0};
     const cls=q.verdict.replace(' ','');
+    // Colour the head-map electrode to match this channel's contact.
+    const el=document.getElementById('el_'+c);
+    if(el)el.setAttribute('class','el '+cls);
     return '<div class="ch"><div class="n">'+c+' · '+LBL[c]+'</div>'+
       '<div class="v '+cls+'">'+q.verdict+'</div>'+
       '<div class="m">'+q.std+' µV · '+q.railed+'% railed</div></div>';
   }).join('');
+  // Reception (share of the nominal 256 Hz arriving) and mains hum.
+  const rv=document.getElementById('recv');
+  if(d.connected){const pc=Math.min(100,Math.round(d.rate/256*100));
+    rv.textContent=pc+'%';rv.className=pc>=90?'good':(pc>=60?'':'warn');}
+  else{rv.textContent='—';rv.className='';}
+  const mn=document.getElementById('mains'), m=d.mains||{hz:null,uv:0};
+  if(!d.connected||m.hz===null){mn.textContent='—';mn.className='';}
+  else{mn.textContent=m.hz+' Hz · '+m.uv+' µV';
+    mn.className = m.uv<10?'good':(m.uv<30?'':'warn');}
   CH.forEach(c=>draw(canv[c],d.traces[c]));
   CH.forEach(c=>{const b=d.bands[c]||{};
     BANDS.forEach((name,i)=>{const el=document.getElementById('bar_'+c+'_'+i);
