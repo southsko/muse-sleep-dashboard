@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS nights (
     -- Lifestyle annotations logged from the live page (coffee, weed, exercise…),
     -- JSON list of {ts_local, text}, matched to this night and marked on the plot.
     annotations_json TEXT,
+    hr_json          TEXT,               -- heart rate from optics bursts, [{ts_local,bpm}]
     notes            TEXT,
     tags             TEXT
 );
@@ -91,7 +92,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "SE_worn": "REAL", "SE_recording": "REAL", "awakenings": "INTEGER",
         "wear_start_time": "TEXT", "sleep_onset_time": "TEXT",
         "final_wake_time": "TEXT", "notes": "TEXT", "tags": "TEXT",
-        "annotations_json": "TEXT",
+        "annotations_json": "TEXT", "hr_json": "TEXT",
     }
     for col, decl in wanted.items():
         if col not in have:
@@ -178,6 +179,7 @@ def upsert_night(conn: sqlite3.Connection, result: dict, asset_dir: str) -> None
         "assets_json": json.dumps(result.get("outputs") or {}),
         "asset_dir": asset_dir,
         "annotations_json": json.dumps(result.get("annotations") or []),
+        "hr_json": json.dumps(result.get("hr") or []),
     }
     for key, col in STAT_COLUMNS.items():
         row[col] = stats.get(key)

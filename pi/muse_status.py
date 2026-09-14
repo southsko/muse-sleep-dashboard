@@ -477,6 +477,10 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 .notepanel button{background:var(--accent);color:#0b1016;border:none;border-radius:6px;
   padding:.55rem 1.1rem;font-size:.9rem;font-weight:600;cursor:pointer}
 .notepanel button:disabled{opacity:.5}
+.lightbtn{background:var(--panel2,#1b2027);color:var(--fg);border:1px solid var(--accent);
+  border-radius:7px;padding:.55rem 1rem;font-size:.9rem;font-weight:600;cursor:pointer}
+.lightbtn:hover{background:var(--accent);color:#0b1016}
+.lightbtn:disabled{opacity:.5;cursor:default}
 
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
 @media(max-width:640px){
@@ -523,6 +527,14 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
         <div class="vval"><span id="mv">—</span></div>
         <div class="vsub" id="mvsub"></div></div>
     </div>
+    <div style="margin-top:.8rem">
+      <button id="opticsbtn" class="lightbtn" type="button">🔦 Pulse the light 5 min → read heart rate</button>
+      <span id="opticsmsg" class="stat"></span>
+    </div>
+    <div class="note" style="margin-top:.35rem">EEG-only keeps the LEDs off to save
+      battery, so pulse reads “—”. Tap to run a 5-minute optics burst on the next
+      segment — the LEDs come on, heart rate is captured to the night, then it drops
+      straight back to EEG-only.</div>
   </div>
   <div class="panel"><h2>Electrode contact</h2>
     <div class="contactwrap">
@@ -638,6 +650,17 @@ function sendNote(){
 }
 document.getElementById('notef').addEventListener('submit',sendNote);
 
+// Optics "light stab": ask the recorder for one 5-min burst to read heart rate.
+const obtn=document.getElementById('opticsbtn'), omsg=document.getElementById('opticsmsg');
+obtn.onclick=()=>{
+  obtn.disabled=true;
+  fetch('/optics',{method:'POST'}).then(r=>r.json()).then(d=>{
+    omsg.textContent=d.ok?'✓ queued — the light comes on at the next segment':'failed';
+    omsg.style.color=d.ok?'var(--good)':'var(--bad)';
+  }).catch(()=>{omsg.textContent='error';omsg.style.color='var(--bad)';})
+   .finally(()=>{setTimeout(()=>{omsg.textContent='';obtn.disabled=false;},7000);});
+};
+
 let PAGE_V=null;
 const es=new EventSource('/stream');
 es.onmessage=e=>{
@@ -706,6 +729,7 @@ es.onerror=()=>{document.getElementById('conn').innerHTML=
 
 
 ANNOT_PATH = os.path.join(RECDIR, "annotations.jsonl")
+OPTICS_REQ_PATH = os.path.join(RECDIR, ".optics_now")   # touch => recorder does one burst
 
 
 def _night_date_now() -> str:
@@ -757,6 +781,14 @@ class Handler(BaseHTTPRequestHandler):
             entry = add_note(text)
             return self._json({"ok": bool(entry), "entry": entry},
                               200 if entry else 400)
+        if self.path.startswith("/optics"):
+            # Ask the recorder for one optics burst (LEDs on, heart rate) on its
+            # next segment. It clears the flag when it starts the burst.
+            try:
+                open(OPTICS_REQ_PATH, "w").close()
+                return self._json({"ok": True})
+            except OSError:
+                return self._json({"ok": False}, 500)
         self.send_response(404)
         self.end_headers()
 

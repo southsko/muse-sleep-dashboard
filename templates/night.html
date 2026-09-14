@@ -44,6 +44,18 @@
     {% endfor %}
   </div>
   {% endif %}
+  {% if hr %}
+  {% set bpms = hr | map(attribute='bpm') | list %}
+  <div class="events">
+    <span class="evtlbl">❤️ Heart rate</span>
+    <span class="evt">{{ (bpms | sum / bpms | length) | round | int }} bpm avg
+      · {{ bpms | min | round | int }}–{{ bpms | max | round | int }} range
+      · {{ bpms | length }} reading{{ 's' if bpms | length != 1 else '' }}</span>
+    {% for h in hr %}
+    <span class="evt">{{ h.ts_local[11:16] }} · {{ h.bpm | round | int }} bpm</span>
+    {% endfor %}
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 

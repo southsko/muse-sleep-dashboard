@@ -22,6 +22,7 @@ timezone, so do not "fix" either to match the other.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -63,6 +64,17 @@ STOP_HOUR = os.environ.get("STOP_HOUR", "").strip()       # optional: stop loopi
 
 FS = 256.0
 EEG_COLS = ["TP9", "AF7", "AF8", "TP10"]
+
+# Optics "light stabs": we normally record EEG-only (p21, LEDs off, low power). A
+# burst runs one short segment on a dim-optics preset so the LEDs come on and we
+# can read heart rate from the PPG, then it drops straight back to p21. On demand
+# via the status-page button (drops OPTICS_REQ); OPTICS_EVERY_MIN>0 also schedules
+# them. The burst's EEG is still normal EEG4, so the night stays continuous.
+OPTICS_PRESET = os.environ.get("OPTICS_PRESET", "p1035")          # EEG4 + dim optics
+OPTICS_BURST_SEC = int(os.environ.get("OPTICS_BURST_SEC", "300"))  # 5 min
+OPTICS_EVERY_MIN = int(os.environ.get("OPTICS_EVERY_MIN", "0"))    # 0 = only on demand
+OPTICS_REQ = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / ".optics_now"
+HR_LOG = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / "hr.jsonl"
 
 # The OpenMuse console script lives in the venv's bin/ next to this python. The
 # systemd unit runs `<venv>/bin/python muse_athena_record.py` directly (not an
@@ -150,15 +162,16 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
-def record_segment(mac: str, raw_path: Path) -> tuple[float, int]:
+def record_segment(mac: str, raw_path: Path,
+                   preset: str = PRESET, duration_sec: int = SEGMENT_SEC) -> tuple[float, int]:
     """Returns (seconds_ran, bytes_written). Kills the recorder if the file
     stops growing — OpenMuse can sit alive after the link dies."""
     # Flags confirmed on fw 3.1.15: record --address --preset --duration --outfile
     # (no --record needed). "Device ... was not found" here just means the band
     # isn't advertising this instant (asleep, or held by the phone app) — the loop
     # retries and latches when it comes back.
-    cmd = [OPENMUSE, "record", "--address", mac, "--preset", PRESET,
-           "--duration", str(SEGMENT_SEC), "--outfile", str(raw_path)]
+    cmd = [OPENMUSE, "record", "--address", mac, "--preset", preset,
+           "--duration", str(duration_sec), "--outfile", str(raw_path)]
     log.info("recording: %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(cmd, start_new_session=True)
@@ -281,6 +294,55 @@ def _past_stop_hour() -> bool:
         return False
 
 
+def extract_and_log_hr(raw_path: Path) -> int | None:
+    """Decode the OPTICS (PPG) from an optics-burst raw file, estimate heart rate
+    (strongest 0.7-4 Hz peak), and append {ts_local, bpm} to hr.jsonl — which rides
+    the recordings share to the server like annotations do. Best-effort."""
+    try:
+        import OpenMuse
+        import numpy as np
+        import pandas as pd
+        from scipy.signal import welch
+        with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln for ln in f if ln.strip()]
+        frames = []
+        for i in range(0, len(lines), 200):
+            try:
+                d = OpenMuse.decode_rawdata(lines[i:i + 200])
+            except Exception:
+                continue
+            opt = d.get("OPTICS")
+            if opt is not None and len(opt):
+                frames.append(opt)
+        if not frames:
+            return None
+        opt = pd.concat(frames, ignore_index=True)
+        cols = [c for c in opt.columns if c != "time"]
+        arr = opt[cols].apply(pd.to_numeric, errors="coerce").to_numpy()
+        best_bpm, best_pow = None, 0.0
+        for j in range(arr.shape[1]):
+            x = arr[:, j]
+            if not np.isfinite(x).all() or np.std(x) == 0:
+                continue
+            fr, p = welch(x - x.mean(), fs=64.0, nperseg=min(len(x), 512))
+            band = (fr >= 0.7) & (fr <= 4.0)
+            if not band.any():
+                continue
+            pw = float(p[band].max())
+            if pw > best_pow:
+                best_pow, best_bpm = pw, float(fr[band][np.argmax(p[band])]) * 60.0
+        if not best_bpm:
+            return None
+        bpm = int(round(best_bpm))
+        with open(HR_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts_local": datetime.now().astimezone().isoformat(
+                timespec="seconds"), "bpm": bpm}) + "\n")
+        return bpm
+    except Exception as exc:
+        log.warning("HR extraction failed: %s", exc)
+        return None
+
+
 def _recover_orphans() -> None:
     """Re-decode any raw .txt that has no matching CSV — a segment whose in-loop
     decode failed (kept, not deleted), or a raw left behind by a crash/reboot
@@ -330,6 +392,7 @@ def main_loop() -> int:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     RAWDIR.mkdir(parents=True, exist_ok=True)
     _recover_orphans()   # sweep up anything a prior run left undecoded
+    last_burst = 0.0     # time.time() of the last optics burst (for the schedule)
 
     while not _stop:
         _recover_orphans()   # and again each cycle (cheap when there's nothing to do)
@@ -347,7 +410,19 @@ def main_loop() -> int:
         csv_path = OUTDIR / f"overnight_{stamp}.csv"
         start_epoch = time.time()
 
-        ran, size = record_segment(MAC, raw_path)
+        # A short optics "light stab" (LEDs on, capture heart rate) if the button
+        # requested one or it's due on the schedule; otherwise normal EEG-only p21.
+        burst = OPTICS_REQ.exists() or (
+            OPTICS_EVERY_MIN > 0 and time.time() - last_burst >= OPTICS_EVERY_MIN * 60)
+        if burst:
+            preset, duration = OPTICS_PRESET, OPTICS_BURST_SEC
+            OPTICS_REQ.unlink(missing_ok=True)
+            last_burst = time.time()
+            log.info("optics burst: %s for %ds (capturing heart rate)", preset, duration)
+        else:
+            preset, duration = PRESET, SEGMENT_SEC
+
+        ran, size = record_segment(MAC, raw_path, preset, duration)
 
         if size <= 0:
             # No packets at all: the link never came up. Back off and rebuild
@@ -367,6 +442,12 @@ def main_loop() -> int:
             log.exception("decode failed for %s (raw kept): %s", raw_path.name, exc)
             n = -1
 
+        # Pull heart rate out of an optics burst before the raw is discarded.
+        if burst and n >= 0 and raw_path.exists():
+            bpm = extract_and_log_hr(raw_path)
+            if bpm:
+                log.info("heart rate from optics burst: %d bpm", bpm)
+
         if n >= 0 and not KEEP_RAW:
             raw_path.unlink(missing_ok=True)
 
@@ -375,9 +456,10 @@ def main_loop() -> int:
             break
 
         # A segment far shorter than its duration means the link is flaky; the
-        # loop rebuilds the adapter/stream on the next pass.
-        if ran < SEGMENT_SEC / 2:
-            log.info("segment ended early (%.0fs of %ss) — rebuilding", ran, SEGMENT_SEC)
+        # loop rebuilds the adapter/stream on the next pass. (A burst is meant to
+        # be short, so judge it against its own duration, not the hourly default.)
+        if ran < duration / 2:
+            log.info("segment ended early (%.0fs of %ss) — rebuilding", ran, duration)
             time.sleep(RETRY_SEC)
 
     log.info("recorder exiting cleanly")

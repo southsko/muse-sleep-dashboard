@@ -143,6 +143,8 @@ class Result:
     # Lifestyle notes the user logged during the night (coffee, weed, exercise…),
     # each {ts_local, text}, matched to this night and marked on the hypnogram.
     annotations: list[dict] = field(default_factory=list)
+    # Heart-rate readings captured from optics "light stab" bursts, {ts_local, bpm}.
+    hr: list[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -945,6 +947,28 @@ def load_annotations(input_dir: Path) -> list[dict]:
     return out
 
 
+def load_hr(input_dir: Path) -> list[dict]:
+    """Read hr.jsonl — heart-rate readings the recorder captured from optics
+    'light stab' bursts. Returns [{ts_local, bpm}]. Best-effort, never fatal."""
+    out: list[dict] = []
+    try:
+        raw = (input_dir / "hr.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+            dt = datetime.fromisoformat(e["ts_local"])
+            bpm = int(e["bpm"])
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            continue
+        out.append({"ts_local": e["ts_local"], "bpm": bpm, "dt": dt})
+    return out
+
+
 def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     """Score one night, which may span several recorded segments."""
     paths = sorted(csv_paths)
@@ -1108,6 +1132,13 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
             continue
         if -3 <= ep <= n_epochs + 3:
             markers.append((ep, a["text"]))
+
+    # Heart-rate readings from optics bursts that fall within this night.
+    res.hr = [
+        {"ts_local": h["ts_local"], "bpm": h["bpm"]}
+        for h in load_hr(paths[0].parent)
+        if -3 <= (h["dt"] - plot_start).total_seconds() / EPOCH_SEC <= n_epochs + 3
+    ]
 
     # Title the plots with the derivation actually staged on (res.staging_channel,
     # e.g. "AF7-TP10+AF8-TP9"), NOT the single-channel pick `ch` — staging is the
