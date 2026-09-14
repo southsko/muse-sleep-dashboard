@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% set active = 'analytics' %}
+{% block title %}Analytics{% endblock %}
+{% block body %}
+
+{% if a.quality.scored == 0 %}
+<div class="panel"><h2>Analytics</h2><p class="empty">No scored nights yet — record a
+  night and this fills in.</p></div>
+{% else %}
+
+<div class="panel">
+  <h2>Data quality</h2>
+  <p style="margin:0 0 .7rem;font-size:.9rem">
+    Of <strong>{{ a.quality.scored }}</strong> scored nights,
+    <strong style="color:var(--good)">{{ a.quality.clean }}</strong> are clean
+    (band worn ≥2 h, few Bluetooth dropouts) and <strong>{{ a.quality.choppy }}</strong>
+    are too choppy to trust the fine detail. <strong>Everything below uses the clean
+    nights only</strong> — WASO and awakenings on drop-storm nights are radio
+    artefacts, not your sleep.</p>
+  <div class="stagebar" style="height:14px;max-width:420px">
+    <div class="seg" style="width:{{ a.quality.clean_pct }}%;background:var(--good)"
+         title="{{ a.quality.clean }} clean"></div>
+    <div class="seg" style="width:{{ 100 - a.quality.clean_pct }}%;background:var(--muted)"
+         title="{{ a.quality.choppy }} choppy"></div>
+  </div>
+  <p class="note">{{ a.quality.clean_pct }}% of your nights are clean. More clean
+    nights = sharper baselines and correlations.</p>
+</div>
+
+<div class="panel">
+  <h2>Your baselines
+    {% if a.latest_date %}<span class="note" style="text-transform:none;letter-spacing:0">
+      latest clean night: {{ a.latest_date }}</span>{% endif %}</h2>
+  <div class="tiles">
+    {% for c in a.cards %}
+    <div class="tile">
+      <div class="lbl">{{ c.label }}</div>
+      <div class="val">{{ c.value }}</div>
+      <div class="foot">
+        <span class="stat">avg {{ c.avg }}{% if c.n %} · n{{ c.n }}{% endif %}</span>
+        {% if c.z is not none %}
+        <span class="delta {{ 'down' if c.flag else 'flat' }}"
+              title="{{ c.z }} SD from your personal average">
+          {{ '%+.1f'|format(c.z) }}σ{% if c.flag %} ⚠{% endif %}</span>
+        {% endif %}
+      </div>
+      <div style="margin-top:.35rem">{{ c.spark|safe }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  <p class="note">σ = how many standard deviations the latest clean night sits from
+    your personal average; |σ|&nbsp;≥&nbsp;2 (⚠) is an unusual night. Sparklines are
+    your last {{ a.cards[0].n + 1 if a.cards else 0 }} clean nights, oldest→newest.</p>
+</div>
+
+<div class="panel">
+  <h2>What moves together</h2>
+  {% if not a.enough_corr %}
+  <p class="empty">Only {{ a.quality.clean }} clean night(s) so far — correlations
+    need ~8+ before they mean anything. Keep recording clean nights and this
+    populates on its own.</p>
+  {% elif a.corrs %}
+  <div class="scroll"><table>
+    <tr><th>If…</th><th>then…</th><th>strength (r)</th><th>nights</th></tr>
+    {% for c in a.corrs %}
+    <tr>
+      <td colspan="2">{{ c.text }} <span style="color:var(--muted)">({{ c.dir }})</span></td>
+      <td class="{{ 'good' if c.real else '' }}" style="{{ '' if c.real else 'color:var(--muted)' }}">
+        {{ c.strength }} · {{ '%+.2f'|format(c.r) }}</td>
+      <td>{{ c.n }}</td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {% else %}
+  <p class="empty">No computable relationships yet.</p>
+  {% endif %}
+  <p class="note"><strong>Correlation is not causation</strong>, the sample is small,
+    and this is a consumer headband — treat these as things to watch, not findings.
+    Green = a link worth noticing (|r|&nbsp;≥&nbsp;0.4).</p>
+</div>
+
+<div class="panel">
+  <h2>Trends <span class="note" style="text-transform:none;letter-spacing:0">all
+    {{ a.trend.n }} scored nights</span></h2>
+  <div class="grid2">
+    <div><div class="note" style="margin-bottom:.2rem">Time asleep</div>{{ a.trend.tst|safe }}</div>
+    <div><div class="note" style="margin-bottom:.2rem">Efficiency</div>{{ a.trend.eff|safe }}</div>
+  </div>
+  <div style="margin-top:1rem">
+    <div class="note" style="margin-bottom:.2rem">Sleep stages (% of night)</div>
+    {{ a.trend.stages|safe }}
+  </div>
+</div>
+
+{% endif %}
+{% endblock %}

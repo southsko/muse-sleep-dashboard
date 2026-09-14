@@ -197,6 +197,132 @@ def trend_block(rs, window):
     }
 
 
+def _clean_nights(ok):
+    """Nights good enough to trust the fine-grained metrics: scored, the band worn
+    a real stretch, and not shredded by Bluetooth dropouts (which inflate WASO and
+    awakenings). The junk — test naps, drop-storm nights — is excluded so the
+    stats aren't dominated by artefacts."""
+    out = []
+    for r in ok:
+        wear = r.get("wear_minutes") or 0
+        dur = r.get("duration_minutes") or 0
+        gap = r.get("gap_minutes") or 0
+        if wear < 180:                     # excludes naps and daytime test recordings
+            continue
+        if dur > 0 and gap / dur > 0.25:   # >25% of the night lost to dropouts
+            continue
+        if (r.get("TST") or 0) <= 20:
+            continue
+        out.append(r)
+    return out
+
+
+def _pearson(xs, ys):
+    """Pearson r over the paired non-null values; (None, n) if too few or flat."""
+    import math
+    pts = [(x, y) for x, y in zip(xs, ys)
+           if isinstance(x, (int, float)) and isinstance(y, (int, float))]
+    n = len(pts)
+    if n < 6:
+        return None, n
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sx = sum((p[0] - mx) ** 2 for p in pts)
+    sy = sum((p[1] - my) ** 2 for p in pts)
+    if sx <= 0 or sy <= 0:
+        return None, n
+    cov = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    return cov / math.sqrt(sx * sy), n
+
+
+def _strength(r):
+    a = abs(r)
+    if a < 0.2:
+        return "no real link"
+    if a < 0.4:
+        return "weak"
+    if a < 0.6:
+        return "moderate"
+    return "strong"
+
+
+def analytics(rs):
+    """Personal baselines + z-scores, honest correlations on clean nights, data
+    quality, and trends. Robust-first: this is a consumer band and the sample is
+    small, so nothing here is dressed up as clinical."""
+    ok = scored(rs)                       # newest first
+    clean = _clean_nights(ok)
+
+    metrics = [
+        ("Time asleep", "TST", " min", True),
+        ("Efficiency (worn)", "SE_worn", "%", False),
+        ("REM", "pct_REM", "%", False),
+        ("Deep (N3)", "pct_N3", "%", False),
+        ("Onset latency", "SOL", " min", False),
+        ("WASO", "WASO", " min", False),
+        ("Awakenings", "awakenings", "", False),
+    ]
+
+    cards = []
+    latest = clean[0] if clean else None
+    hist = clean[1:] if clean else []
+    for label, key, unit, as_dur in metrics:
+        vals = [r[key] for r in hist if isinstance(r.get(key), (int, float))]
+        v = latest.get(key) if latest else None
+        mean = statistics.mean(vals) if len(vals) >= 3 else None
+        sd = statistics.pstdev(vals) if len(vals) >= 3 else None
+        z = ((v - mean) / sd) if (mean is not None and sd and sd > 0
+                                  and isinstance(v, (int, float))) else None
+        series = [r.get(key) for r in clean[:SPARK_NIGHTS]][::-1]
+        cards.append({
+            "label": label,
+            "value": (charts.fmt_dur(v) if as_dur else
+                      (f"{round(v, 1):g}{unit}" if isinstance(v, (int, float)) else "—")),
+            "avg": (f"{round(mean, 1):g}{unit}" if mean is not None else "—"),
+            "sd": round(sd, 1) if sd is not None else None,
+            "z": round(z, 1) if z is not None else None,
+            "n": len(vals),
+            "flag": z is not None and abs(z) >= 2,
+            "spark": charts.sparkline(series),
+        })
+
+    pairs = [
+        ("Longer to fall asleep", "SOL", "shorter total sleep", "TST"),
+        ("More deep sleep", "pct_N3", "more REM", "pct_REM"),
+        ("More awakenings", "awakenings", "lower efficiency", "SE_worn"),
+        ("More dropout gaps", "gap_minutes", "lower efficiency", "SE_worn"),
+        ("Later onset latency", "SOL", "less REM", "pct_REM"),
+    ]
+    corrs = []
+    for a_lbl, ka, b_lbl, kb in pairs:
+        r, n = _pearson([x.get(ka) for x in clean], [x.get(kb) for x in clean])
+        if r is None:
+            continue
+        corrs.append({
+            "text": f"{a_lbl} → {b_lbl}",
+            "r": round(r, 2), "n": n,
+            "dir": "↑ together" if r > 0 else "↓ opposite",
+            "strength": _strength(r),
+            "real": abs(r) >= 0.4,
+        })
+    corrs.sort(key=lambda c: -abs(c["r"]))
+
+    quality = {
+        "scored": len(ok),
+        "clean": len(clean),
+        "choppy": len(ok) - len(clean),
+        "clean_pct": round(100 * len(clean) / len(ok)) if ok else 0,
+    }
+    return {
+        "cards": cards,
+        "corrs": corrs,
+        "quality": quality,
+        "latest_date": latest.get("night_date") if latest else None,
+        "trend": trend_block(rs, "all"),
+        "enough_corr": len(clean) >= 8,
+    }
+
+
 def health() -> dict:
     """Is the pipeline actually receiving data? Surfaced prominently.
 
@@ -279,6 +405,12 @@ def nights():
     return render_template("nights.html", nights=rs, sort=sort,
                            dir="desc" if desc else "asc",
                            hide_failed=hide_failed, stage_bar=charts.stage_bar)
+
+
+@app.route("/analytics")
+def analytics_page():
+    rs = rows()
+    return render_template("analytics.html", active="analytics", a=analytics(rs))
 
 
 @app.route("/night/<path:source>")
