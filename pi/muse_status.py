@@ -27,7 +27,9 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 from collections import deque
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -468,6 +470,13 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 .sighealth{display:flex;gap:1.2rem;margin-top:.7rem;font-size:.82rem;color:var(--muted)}
 .sighealth b{font-variant-numeric:tabular-nums} .sighealth b.warn{color:var(--warn)}
 .sighealth b.good{color:var(--good)}
+.notepanel form{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.notepanel input{flex:1 1 220px;background:var(--panel2,#1b2027);color:var(--fg);
+  border:1px solid var(--line);border-radius:6px;padding:.55rem .65rem;font-size:.92rem}
+.notepanel input:focus{outline:none;border-color:var(--accent)}
+.notepanel button{background:var(--accent);color:#0b1016;border:none;border-radius:6px;
+  padding:.55rem 1.1rem;font-size:.9rem;font-weight:600;cursor:pointer}
+.notepanel button:disabled{opacity:.5}
 
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
 @media(max-width:640px){
@@ -496,6 +505,16 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 </header>
 <main>
   <div id="battwarn" class="battwarn"></div>
+  <div class="panel notepanel">
+    <form id="notef" onsubmit="return false">
+      <input id="notetext" type="text" maxlength="200" autocomplete="off"
+             placeholder="Log an event — coffee, weed, workout, screen time…">
+      <button id="notebtn" type="submit">Add note</button>
+      <span id="notemsg" class="stat"></span>
+    </form>
+    <div class="note" style="margin-top:.35rem">Stamped with the current time and
+      filed under tonight — shows up on the night's hypnogram once it processes.</div>
+  </div>
   <div class="panel"><h2>Pulse &amp; movement <span class="stat" style="text-transform:none">from optics + IMU</span></h2>
     <div class="vitals">
       <div class="vital"><div class="vlbl">Heart rate</div>
@@ -601,6 +620,24 @@ function draw(cv,data){
   x.stroke();
 }
 
+// Lifestyle note field: POST to /note, which appends to the annotations file that
+// rides the recordings share to the server.
+const nbtn=document.getElementById('notebtn'), ntext=document.getElementById('notetext'),
+      nmsg=document.getElementById('notemsg');
+function sendNote(){
+  const v=ntext.value.trim(); if(!v)return;
+  nbtn.disabled=true;
+  fetch('/note',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'text='+encodeURIComponent(v)})
+   .then(r=>r.json()).then(d=>{
+     if(d.ok){nmsg.textContent='✓ noted '+d.entry.ts_local.slice(11,16);nmsg.style.color='var(--good)';ntext.value='';}
+     else{nmsg.textContent='could not save';nmsg.style.color='var(--bad)';}
+     setTimeout(()=>{nmsg.textContent='';},4000);
+   }).catch(()=>{nmsg.textContent='error';nmsg.style.color='var(--bad)';})
+   .finally(()=>{nbtn.disabled=false;});
+}
+document.getElementById('notef').addEventListener('submit',sendNote);
+
 let PAGE_V=null;
 const es=new EventSource('/stream');
 es.onmessage=e=>{
@@ -668,11 +705,60 @@ es.onerror=()=>{document.getElementById('conn').innerHTML=
 """
 
 
+ANNOT_PATH = os.path.join(RECDIR, "annotations.jsonl")
+
+
+def _night_date_now() -> str:
+    d = datetime.now()
+    if d.hour < 12:
+        d -= timedelta(days=1)
+    return d.date().isoformat()
+
+
+def add_note(text: str) -> dict | None:
+    """Append a timestamped lifestyle note to ~/recordings/annotations.jsonl. It
+    lives with the recordings, so it rides the same SMB share to the server, where
+    the analyzer attaches it to the night and marks it on the hypnogram."""
+    text = (text or "").strip()[:200]
+    if not text:
+        return None
+    now = datetime.now().astimezone()
+    entry = {"night_date": _night_date_now(),
+             "ts_local": now.isoformat(timespec="seconds"),
+             "text": text,
+             "logged_at": now.isoformat(timespec="seconds")}
+    try:
+        with open(ANNOT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        return None
+    return entry
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):        # keep the journal clean
         pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path.startswith("/note"):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            text = urllib.parse.parse_qs(raw).get("text", [""])[0] or raw
+            entry = add_note(text)
+            return self._json({"ok": bool(entry), "entry": entry},
+                              200 if entry else 400)
+        self.send_response(404)
+        self.end_headers()
 
     def do_GET(self):
         if self.path.startswith("/stream"):

@@ -36,6 +36,14 @@
 <div class="panel">
   <h2>Hypnogram</h2>
   <img class="plot" src="/asset/{{ n.asset_dir }}/{{ assets.hypnogram }}" alt="hypnogram">
+  {% if annotations %}
+  <div class="events">
+    <span class="evtlbl">Events logged</span>
+    {% for a in annotations %}
+    <span class="evt">🟡 {{ a.ts_local[11:16] }} · {{ a.text }}</span>
+    {% endfor %}
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 

@@ -306,6 +306,7 @@ def night(source):
         n=match,
         channels=json.loads(match.get("channels_json") or "[]"),
         assets=json.loads(match.get("assets_json") or "{}"),
+        annotations=json.loads(match.get("annotations_json") or "[]"),
         deltas=deltas,
         prev=rs[idx + 1] if idx + 1 < len(rs) else None,
         next=rs[idx - 1] if idx > 0 else None,

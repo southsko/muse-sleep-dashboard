@@ -93,11 +93,14 @@ fi
 ok "Samba password set"
 
 # -------------------------------------------------------------- base packages --
-bold "System packages (venv tooling + Samba)"
+bold "System packages (venv tooling + Samba + mDNS)"
 sudo apt-get update -qq
+# avahi-daemon advertises <hostname>.local over mDNS/Bonjour, so the Pi is
+# reachable by name (e.g. brain.local) with no DNS setup on your network.
 sudo apt-get install -y --no-install-recommends \
-    python3-venv python3-pip git samba samba-common-bin
-ok "installed"
+    python3-venv python3-pip git samba samba-common-bin avahi-daemon
+sudo systemctl enable --now avahi-daemon 2>/dev/null || true
+ok "installed (mDNS: this Pi is reachable as $(hostname).local)"
 
 # ----------------------------------------------------------------- venv ----
 bold "Python virtual environment (${VENV})"
@@ -168,10 +171,10 @@ fi
 
 cat <<NEXT
 
-   Status page   http://${IP}:${STATUS_PORT}/
+   Status page   http://$(hostname).local:${STATUS_PORT}/   (or http://${IP}:${STATUS_PORT}/)
    Watch logs    journalctl -u muse-athena-record -f
    Recordings    ${OUTDIR}
-   SMB share     //${IP}/recordings  (user ${USER_NAME})
+   SMB share     //$(hostname).local/recordings  (user ${USER_NAME})
 
    On the analysis host, point the mount at this Pi and restart the container:
 

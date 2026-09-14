@@ -140,6 +140,9 @@ class Result:
     edfs: list[str] = field(default_factory=list)
     n_segments: int = 1
     gap_minutes: float = 0.0
+    # Lifestyle notes the user logged during the night (coffee, weed, exercise…),
+    # each {ts_local, text}, matched to this night and marked on the hypnogram.
+    annotations: list[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -472,7 +475,8 @@ def _clock_prefs() -> tuple[str, str]:
 
 def plot_hypnogram(hypno, out_path: Path, title: str,
                    start_dt: datetime | None = None,
-                   clock_fmt: str = "24") -> None:
+                   clock_fmt: str = "24",
+                   markers: list | None = None) -> None:
     """Draw the night as coloured bouts on stage rows.
 
     yasa's default plot is a bare line, which makes it hard to see at a glance
@@ -535,6 +539,13 @@ def plot_hypnogram(hypno, out_path: Path, title: str,
         ax.set_xticklabels([_lbl(t) for t in ticks], fontsize=9)
     else:
         ax.set_xlabel("Epoch (30 s)", fontsize=9)
+
+    # Lifestyle-note markers: a dashed vertical line with the label at the top.
+    for ex, label in (markers or []):
+        ax.axvline(ex, color="#e0b341", lw=1.1, ls="--", alpha=0.85, zorder=6)
+        ax.annotate(label, xy=(ex, -0.7), xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=8, color="#e0b341",
+                    clip_on=False, zorder=6)
 
     ax.set_title(title, fontsize=11, pad=10)
     for side in ("top", "right", "left"):
@@ -911,6 +922,29 @@ def _expand_gaps(is_gap, guard: int) -> np.ndarray:
     return out
 
 
+def load_annotations(input_dir: Path) -> list[dict]:
+    """Read the recorder's annotations.jsonl — lifestyle notes the user logged from
+    the live page (coffee, weed, exercise…). Returns [{night_date, ts_local, text}].
+    Missing/unreadable file → empty; a bad line is skipped, never fatal."""
+    out: list[dict] = []
+    try:
+        raw = (input_dir / "annotations.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+            datetime.fromisoformat(e["ts_local"])          # validate
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            continue
+        out.append({"night_date": e.get("night_date"),
+                    "ts_local": e["ts_local"], "text": str(e.get("text", ""))[:200]})
+    return out
+
+
 def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     """Score one night, which may span several recorded segments."""
     paths = sorted(csv_paths)
@@ -1058,13 +1092,30 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
         except Exception:
             pass
 
+    # Lifestyle notes logged during this night → vertical markers on the hypnogram
+    # (and stored for the night page), so an event lines up against the sleep it
+    # preceded — e.g. a puff at 22:18 against onset latency and REM.
+    res.annotations = [
+        {"ts_local": a["ts_local"], "text": a["text"]}
+        for a in load_annotations(paths[0].parent)
+        if a["night_date"] == res.night_date
+    ]
+    markers = []
+    for a in res.annotations:
+        try:
+            ep = (datetime.fromisoformat(a["ts_local"]) - plot_start).total_seconds() / EPOCH_SEC
+        except (ValueError, TypeError):
+            continue
+        if -3 <= ep <= n_epochs + 3:
+            markers.append((ep, a["text"]))
+
     # Title the plots with the derivation actually staged on (res.staging_channel,
     # e.g. "AF7-TP10+AF8-TP9"), NOT the single-channel pick `ch` — staging is the
     # bipolar ensemble, and labelling it "staged on AF7" misrepresents the montage.
     suffix = f" ({len(paths)} segments)" if len(paths) > 1 else ""
     plot_hypnogram(hypno, hypno_png,
                    f"{name} — staged on {res.staging_channel}{suffix}",
-                   start_dt=plot_start, clock_fmt=pref_fmt)
+                   start_dt=plot_start, clock_fmt=pref_fmt, markers=markers)
     res.outputs["hypnogram"] = hypno_png.name
 
     if proba is not None and not proba.empty:
