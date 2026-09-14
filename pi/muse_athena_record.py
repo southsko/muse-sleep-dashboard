@@ -66,15 +66,39 @@ FS = 256.0
 EEG_COLS = ["TP9", "AF7", "AF8", "TP10"]
 
 # Optics "light stabs": we normally record EEG-only (p21, LEDs off, low power). A
-# burst runs one short segment on a dim-optics preset so the LEDs come on and we
-# can read heart rate from the PPG, then it drops straight back to p21. On demand
-# via the status-page button (drops OPTICS_REQ); OPTICS_EVERY_MIN>0 also schedules
-# them. The burst's EEG is still normal EEG4, so the night stays continuous.
-OPTICS_PRESET = os.environ.get("OPTICS_PRESET", "p1035")          # EEG4 + dim optics
+# burst runs one short segment on an optics preset so the LEDs come on and the
+# status page can read vitals from the PPG, then it drops straight back to p21.
+# On demand via the status-page button (writes a mode word to OPTICS_REQ);
+# OPTICS_EVERY_MIN>0 also schedules them. The burst's EEG is still normal EEG4, so
+# the night stays continuous.
+#   quick (dim, p1035): heart rate + HRV + respiration, minimal battery cost.
+#   deep  (bright, p1041): also lights the RED LED = 16-channel optics, which is
+#         what a relative blood-oxygen (SpO2) index needs — at ~0.7%/min it is the
+#         costly one, so it is opt-in, never the default or the schedule.
+OPTICS_PRESET = os.environ.get("OPTICS_PRESET", "p1035")          # dim: HR/HRV/resp
+DEEP_PRESET = os.environ.get("DEEP_PRESET", "p1041")              # bright 16-ch: +O2
 OPTICS_BURST_SEC = int(os.environ.get("OPTICS_BURST_SEC", "300"))  # 5 min
 OPTICS_EVERY_MIN = int(os.environ.get("OPTICS_EVERY_MIN", "0"))    # 0 = only on demand
 OPTICS_REQ = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / ".optics_now"
 HR_LOG = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / "hr.jsonl"
+
+
+def _burst_request() -> dict | None:
+    """The pending optics-burst request, or None. The status page writes a mode
+    word into the flag file: 'deep' picks the bright preset (red LED, adds the O2
+    index) at a heavier battery cost; anything else is the dim quick burst. A bare
+    'pXXXX' is honoured as a literal preset for debugging."""
+    if not OPTICS_REQ.exists():
+        return None
+    try:
+        mode = OPTICS_REQ.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        mode = ""
+    if mode in ("deep", DEEP_PRESET):
+        return {"preset": DEEP_PRESET, "duration": OPTICS_BURST_SEC, "mode": "deep"}
+    if mode.startswith("p") and mode[1:].isdigit():
+        return {"preset": mode, "duration": OPTICS_BURST_SEC, "mode": mode}
+    return {"preset": OPTICS_PRESET, "duration": OPTICS_BURST_SEC, "mode": "quick"}
 
 # The OpenMuse console script lives in the venv's bin/ next to this python. The
 # systemd unit runs `<venv>/bin/python muse_athena_record.py` directly (not an
@@ -163,9 +187,15 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def record_segment(mac: str, raw_path: Path,
-                   preset: str = PRESET, duration_sec: int = SEGMENT_SEC) -> tuple[float, int]:
+                   preset: str = PRESET, duration_sec: int = SEGMENT_SEC,
+                   interruptible: bool = False) -> tuple[float, int]:
     """Returns (seconds_ran, bytes_written). Kills the recorder if the file
-    stops growing — OpenMuse can sit alive after the link dies."""
+    stops growing — OpenMuse can sit alive after the link dies.
+
+    interruptible: end this segment early if an optics burst is requested, so a
+    tap on the status page lights up within seconds instead of waiting out the
+    rest of an hour-long segment. Only normal segments are interruptible; a burst
+    itself runs to completion."""
     # Flags confirmed on fw 3.1.15: record --address --preset --duration --outfile
     # (no --record needed). "Device ... was not found" here just means the band
     # isn't advertising this instant (asleep, or held by the phone app) — the loop
@@ -184,6 +214,9 @@ def record_segment(mac: str, raw_path: Path,
     try:
         while proc.poll() is None:
             if _stop:
+                break
+            if interruptible and OPTICS_REQ.exists():
+                log.info("optics burst requested — ending this segment early to start it")
                 break
             time.sleep(POLL_SEC)
             size = raw_path.stat().st_size if raw_path.exists() else 0
@@ -410,19 +443,28 @@ def main_loop() -> int:
         csv_path = OUTDIR / f"overnight_{stamp}.csv"
         start_epoch = time.time()
 
-        # A short optics "light stab" (LEDs on, capture heart rate) if the button
+        # A short optics "light stab" (LEDs on, capture vitals) if the button
         # requested one or it's due on the schedule; otherwise normal EEG-only p21.
-        burst = OPTICS_REQ.exists() or (
-            OPTICS_EVERY_MIN > 0 and time.time() - last_burst >= OPTICS_EVERY_MIN * 60)
+        req = _burst_request()
+        scheduled = (OPTICS_EVERY_MIN > 0
+                     and time.time() - last_burst >= OPTICS_EVERY_MIN * 60)
+        burst = bool(req) or scheduled
         if burst:
-            preset, duration = OPTICS_PRESET, OPTICS_BURST_SEC
+            if req:
+                preset, duration, mode = req["preset"], req["duration"], req["mode"]
+            else:
+                preset, duration, mode = OPTICS_PRESET, OPTICS_BURST_SEC, "quick"
             OPTICS_REQ.unlink(missing_ok=True)
             last_burst = time.time()
-            log.info("optics burst: %s for %ds (capturing heart rate)", preset, duration)
+            log.info("optics burst (%s): %s for %ds (capturing vitals)",
+                     mode, preset, duration)
         else:
             preset, duration = PRESET, SEGMENT_SEC
 
-        ran, size = record_segment(MAC, raw_path, preset, duration)
+        # Normal segments end early when a burst is requested, so a tap lights the
+        # LEDs within seconds instead of waiting out the rest of the hour.
+        ran, size = record_segment(MAC, raw_path, preset, duration,
+                                   interruptible=not burst)
 
         if size <= 0:
             # No packets at all: the link never came up. Back off and rebuild

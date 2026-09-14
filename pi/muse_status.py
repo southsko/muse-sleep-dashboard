@@ -75,7 +75,9 @@ BANDS = [("Delta", 0.5, 4.0), ("Theta", 4.0, 8.0), ("Alpha", 8.0, 12.0),
 # can show heart rate and movement "for free" from data already arriving — the
 # silver lining of not being able to turn the optics LEDs off.
 PPG_FS = 64.0                      # OPTICS sample rate
-PPG_SEC = 16.0                     # window for a stable heart-rate estimate
+PPG_SEC = 40.0                     # optics window: long enough for HRV + respiration
+#                                    (respiration lives at 0.1-0.4 Hz, so it needs
+#                                    tens of seconds, not the ~16 s HR alone wants)
 ACC_FS = 52.0                      # ACCGYRO sample rate (approximate)
 ACC_SEC = 8.0                      # window for the movement metric
 
@@ -97,9 +99,11 @@ class Collector:
         self._cur_file = None
         self._last_ts = ""             # ISO timestamp of the last raw line ingested
         self.ppg = deque(maxlen=int(PPG_SEC * PPG_FS))   # optics rows (PPG channels)
+        self.ppg_cols: list[str] = []  # live optics column names (varies by preset)
+        self.ppg_at = 0.0              # last time optics rows actually arrived
         self.acc = deque(maxlen=int(ACC_SEC * ACC_FS))   # accel magnitude, g
-        self._hr = None                # cached heart rate (recomputed ~1/s)
-        self._hr_at = 0.0
+        self._vit = None               # cached optics vitals bundle (recomputed ~1/s)
+        self._vit_at = 0.0
 
     def _newest_raw(self) -> str | None:
         files = glob.glob(os.path.join(RAWDIR, "*.txt"))
@@ -174,9 +178,15 @@ class Collector:
             chans = [c for c in opt.columns if c != "time"]
             if chans:
                 arr = opt[chans].apply(pd.to_numeric, errors="coerce").to_numpy()
-                with self.lock:
-                    for row in arr:
-                        self.ppg.append(row)
+                # Optics rows are all-zero on the EEG-only presets even when the
+                # frame decodes (see recorder note); only treat it as a live burst
+                # when the LEDs are actually driving signal.
+                if np.any(np.abs(arr) > 1e-9):
+                    with self.lock:
+                        self.ppg_cols = chans
+                        for row in arr:
+                            self.ppg.append(row)
+                    self.ppg_at = now
         acc = data.get("ACCGYRO")
         if acc is not None and len(acc):
             axc = [c for c in acc.columns if c.startswith("ACC")]
@@ -263,35 +273,134 @@ def bandpower(arr: np.ndarray, ch_index: int) -> dict:
     return out
 
 
-def heart_rate(c: "Collector") -> int | None:
-    """Beats/min from the strongest pulsatile PPG (optics) channel — the dominant
-    spectral peak in 0.7-4 Hz (42-240 bpm). Cached ~1s: a Welch over 16 channels
-    is not free at the SSE frame rate."""
+def _band_filter(x: np.ndarray, lo: float, hi: float, fs: float) -> np.ndarray:
+    from scipy.signal import butter, filtfilt
+    b, a = butter(2, [lo / (fs / 2), hi / (fs / 2)], btype="band")
+    return filtfilt(b, a, x)
+
+
+def optics_vitals(c: "Collector") -> dict:
+    """Everything the optics burst physically carries, from ONE fused pulse signal.
+
+    Heart rate, HRV, and respiration come from a clean blood-volume-pulse (BVP)
+    built with OpenMuse's own multi-channel PPG fusion (ambient subtraction +
+    per-channel signal-quality weighting) — far cleaner than any single channel.
+
+    SpO2 needs both RED and IR light on the same side, which only the 16-channel
+    (bright) optics mode provides. When those channels are absent we return
+    spo2=None with a reason, never a fabricated percentage. When present we report
+    the ratio-of-ratios R (uncalibrated): higher R => lower saturation, so a spike
+    in R is a desaturation dip. It is an honest relative index, not a medical %.
+
+    Cached ~1 s — the fusion + several Welch/peak passes are not free at frame rate.
+    """
     now = time.time()
-    if now - c._hr_at < 1.0:
-        return c._hr
-    from scipy.signal import welch
+    if c._vit is not None and now - c._vit_at < 1.0:
+        return c._vit
+    out = {"hr": None, "hrv": None, "resp": None, "spo2": None,
+           "sqi": None, "channels": [], "nch": 0, "live": False}
     with c.lock:
-        if len(c.ppg) < int(PPG_FS * 5):
-            c._hr, c._hr_at = None, now
+        cols = list(c.ppg_cols)
+        stale = (now - c.ppg_at) > 5.0          # burst ended; optics draining out
+        enough = len(c.ppg) >= int(PPG_FS * 6)
+        arr = np.asarray(c.ppg, dtype=float) if (cols and enough and not stale) else None
+    out["channels"] = cols
+    out["nch"] = len(cols)
+    if arr is None:
+        c._vit, c._vit_at = out, now
+        return out
+    out["live"] = True
+
+    import pandas as pd
+    from scipy.signal import welch, find_peaks
+    df = pd.DataFrame(arr, columns=cols)
+
+    # --- Fused BVP (OpenMuse), with a strongest-channel fallback --------------
+    bvp = None
+    try:
+        from OpenMuse import process
+        bvp, info = process.preprocess_ppg(df, sampling_rate=int(PPG_FS))
+        out["sqi"] = round(float(info.get("mean_sqi", 0.0)), 2)
+    except Exception:
+        bvp = None
+    if bvp is None or not np.isfinite(bvp).any():
+        best, best_pow = None, 0.0
+        for col in cols:
+            x = df[col].to_numpy()
+            if not np.isfinite(x).all() or np.std(x) == 0:
+                continue
+            f, p = welch(x - x.mean(), fs=PPG_FS, nperseg=min(len(x), 512))
+            b = (f >= 0.7) & (f <= 4.0)
+            if b.any() and float(p[b].max()) > best_pow:
+                best_pow, best = float(p[b].max()), x - x.mean()
+        bvp = best
+    if bvp is not None and np.isfinite(bvp).any():
+        bvp = np.nan_to_num(bvp.astype(float))
+        # Heart rate: dominant cardiac-band spectral peak (robust to noise).
+        f, p = welch(bvp, fs=PPG_FS, nperseg=min(len(bvp), 512))
+        b = (f >= 0.7) & (f <= 4.0)
+        if b.any():
+            out["hr"] = int(round(float(f[b][np.argmax(p[b])]) * 60.0))
+        # HRV (RMSSD): scatter of successive beat-to-beat intervals.
+        try:
+            sig = (bvp - np.mean(bvp)) / (np.std(bvp) + 1e-9)
+            pk, _ = find_peaks(sig, distance=int(PPG_FS * 0.4), prominence=0.5)
+            if len(pk) >= 4:
+                ibi = np.diff(pk) / PPG_FS * 1000.0             # ms
+                ibi = ibi[(ibi > 300) & (ibi < 1500)]           # physiologic only
+                if len(ibi) >= 3:
+                    out["hrv"] = int(round(float(np.sqrt(np.mean(np.diff(ibi) ** 2)))))
+        except Exception:
+            pass
+        # Respiration: the breathing rhythm modulates the pulse; find its 0.1-0.4 Hz
+        # (6-24 breaths/min) peak in the BVP.
+        try:
+            fr, pr = welch(bvp, fs=PPG_FS, nperseg=min(len(bvp), 2048))
+            rb = (fr >= 0.1) & (fr <= 0.4)
+            if rb.any():
+                out["resp"] = round(float(fr[rb][np.argmax(pr[rb])]) * 60.0, 1)
+        except Exception:
+            pass
+
+    # --- SpO2 relative index: ratio-of-ratios (R) from RED vs IR --------------
+    # R = (AC/DC)_red / (AC/DC)_ir, the pulse-oximetry ratio. Uncalibrated here:
+    # without a reference oximeter it is a RELATIVE index, not a medical %. A side
+    # is used only if BOTH its red and IR carry a real pulse — the Athena's inner
+    # (LI/RI) sensors routinely saturate (IR pulsatility ~0), and dividing by that
+    # near-zero is what makes R explode; gating to clean sides keeps R stable. The
+    # outer (LO/RO) ring is usually the pulsatile one on the forehead.
+    MIN_IR_PERF, MIN_RED_PERF = 0.008, 0.0015   # empirical floors (measured on band)
+
+    def perfusion(col: str):
+        """AC/DC perfusion index for one channel (cardiac-band RMS over the mean)."""
+        x = df[col].to_numpy()
+        if not np.isfinite(x).all() or len(x) < int(PPG_FS * 4):
             return None
-        arr = np.asarray(c.ppg, dtype=float)
-    best_bpm, best_pow = None, 0.0
-    for j in range(arr.shape[1]):
-        x = arr[:, j]
-        if not np.isfinite(x).all() or np.std(x) == 0:
-            continue
-        f, p = welch(x - x.mean(), fs=PPG_FS, nperseg=min(len(x), 512))
-        band = (f >= 0.7) & (f <= 4.0)
-        if not band.any():
-            continue
-        pw = float(p[band].max())
-        if pw > best_pow:
-            best_pow, best_bpm = pw, float(f[band][np.argmax(p[band])]) * 60.0
-    hr = int(round(best_bpm)) if best_bpm else None
-    with c.lock:
-        c._hr, c._hr_at = hr, now
-    return hr
+        dc = float(np.mean(x))
+        if abs(dc) < 1e-6:
+            return None
+        try:
+            ac = float(np.std(_band_filter(x, 0.6, 4.0, PPG_FS)))
+        except Exception:
+            return None
+        return ac / abs(dc)
+
+    ratios = []
+    for side in ("LO", "RO", "LI", "RI"):
+        red, ir = f"OPTICS_{side}_RED", f"OPTICS_{side}_IR"
+        if red in cols and ir in cols:
+            pr, pi = perfusion(red), perfusion(ir)
+            if pr and pi and pi >= MIN_IR_PERF and pr >= MIN_RED_PERF:
+                ratios.append(pr / pi)
+    if ratios:
+        out["spo2"] = {"R": round(float(np.median(ratios)), 3), "sides": len(ratios)}
+    elif any("_RED" in col for col in cols):
+        out["spo2"] = {"reason": "red on, but no clean pulse yet — adjust the fit"}
+    else:
+        out["spo2"] = {"reason": "no red channel — needs a bright (16-ch) burst"}
+
+    c._vit, c._vit_at = out, now
+    return out
 
 
 def movement(c: "Collector") -> dict:
@@ -365,6 +474,7 @@ except OSError:
 def frame() -> dict:
     arr = COLLECTOR.snapshot()
     rate = COLLECTOR.data_rate()
+    vit = optics_vitals(COLLECTOR)
     # "connected" = data actually arriving (COLLECTOR.connected is the 6 s
     # staleness flag). Do NOT also gate on rate>50: between OpenMuse's bursty file
     # flushes the instantaneous rate briefly reads 0 on a perfectly live link, and
@@ -384,7 +494,8 @@ def frame() -> dict:
         "bands": {ch: bandpower(arr, i) for i, ch in enumerate(CHANNELS)},
         "segment": current_segment(),
         "battery": COLLECTOR.battery,
-        "pulse": heart_rate(COLLECTOR),
+        "pulse": vit["hr"],
+        "vitals": vit,
         "movement": movement(COLLECTOR),
         "mains": mains(arr),
         "traces": traces,
@@ -519,22 +630,36 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
     <div class="note" style="margin-top:.35rem">Stamped with the current time and
       filed under tonight — shows up on the night's hypnogram once it processes.</div>
   </div>
-  <div class="panel"><h2>Pulse &amp; movement <span class="stat" style="text-transform:none">from optics + IMU</span></h2>
+  <div class="panel"><h2>Vitals <span class="stat" style="text-transform:none">from the optics burst (fNIRS/PPG) + IMU</span></h2>
     <div class="vitals">
-      <div class="vital"><div class="vlbl">Heart rate</div>
+      <div class="vital"><div class="vlbl">❤️ Heart rate</div>
         <div class="vval"><span id="hr">—</span><span class="vunit"> bpm</span></div></div>
-      <div class="vital"><div class="vlbl">Movement</div>
+      <div class="vital"><div class="vlbl">〰️ HRV (RMSSD)</div>
+        <div class="vval"><span id="hrv">—</span><span class="vunit"> ms</span></div></div>
+      <div class="vital"><div class="vlbl">🫁 O₂ index</div>
+        <div class="vval"><span id="spo2">—</span></div>
+        <div class="vsub" id="spo2sub">relative · uncalibrated</div></div>
+      <div class="vital"><div class="vlbl">🌬️ Respiration</div>
+        <div class="vval"><span id="resp">—</span><span class="vunit"> /min</span></div></div>
+      <div class="vital"><div class="vlbl">🤸 Movement</div>
         <div class="vval"><span id="mv">—</span></div>
         <div class="vsub" id="mvsub"></div></div>
     </div>
-    <div style="margin-top:.8rem">
-      <button id="opticsbtn" class="lightbtn" type="button">🔦 Pulse the light 5 min → read heart rate</button>
+    <div class="sighealth" style="margin-top:.6rem">
+      <span>pulse quality <b id="sqi">—</b></span>
+      <span>optics channels <b id="optch">—</b></span>
+    </div>
+    <div style="margin-top:.8rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+      <button id="opticsbtn" class="lightbtn" type="button">🔦 Quick pulse · HR · HRV · breathing</button>
+      <button id="deepbtn" class="lightbtn" type="button">🔴 Deep scan · adds O₂ index · more battery</button>
       <span id="opticsmsg" class="stat"></span>
     </div>
     <div class="note" style="margin-top:.35rem">EEG-only keeps the LEDs off to save
-      battery, so pulse reads “—”. Tap to run a 5-minute optics burst on the next
+      battery, so vitals read “—”. Tap to run a 5-minute optics burst on the next
       segment — the LEDs come on, heart rate is captured to the night, then it drops
-      straight back to EEG-only.</div>
+      straight back to EEG-only. Heart rate, HRV and respiration come from the pulse;
+      the <b>O₂ index needs the red LED</b> (a bright 16-channel burst) and is a
+      relative trend, never a medical SpO₂ percentage.</div>
   </div>
   <div class="panel"><h2>Electrode contact</h2>
     <div class="contactwrap">
@@ -568,6 +693,9 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 const CH=["TP9","AF7","AF8","TP10"], canv={};
 const LBL={TP9:'left ear',AF7:'left forehead',AF8:'right forehead',TP10:'right ear'};
 const BANDS=["Delta","Theta","Alpha","Sigma","Beta"];
+let spo2R=[];   // recent ratio-of-ratios, to anchor the relative O₂ index
+function median(a){if(!a.length)return 0;const b=[...a].sort((x,y)=>x-y);
+  const m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2;}
 const wraps=document.getElementById('waves');
 CH.forEach(c=>{const d=document.createElement('div');d.className='wrap';
   d.innerHTML='<div class="lbl">'+c+' <span style="opacity:.6">· '+LBL[c]+'</span></div>';
@@ -650,16 +778,21 @@ function sendNote(){
 }
 document.getElementById('notef').addEventListener('submit',sendNote);
 
-// Optics "light stab": ask the recorder for one 5-min burst to read heart rate.
-const obtn=document.getElementById('opticsbtn'), omsg=document.getElementById('opticsmsg');
-obtn.onclick=()=>{
-  obtn.disabled=true;
-  fetch('/optics',{method:'POST'}).then(r=>r.json()).then(d=>{
-    omsg.textContent=d.ok?'✓ queued — the light comes on at the next segment':'failed';
+// Optics "light stab": ask the recorder for one 5-min burst of live vitals.
+// quick = dim preset (HR/HRV/respiration); deep = bright 16-ch (adds the O₂ index).
+const obtn=document.getElementById('opticsbtn'), dbtn=document.getElementById('deepbtn'),
+      omsg=document.getElementById('opticsmsg');
+function requestBurst(mode){
+  obtn.disabled=dbtn.disabled=true;
+  fetch('/optics?mode='+mode,{method:'POST'}).then(r=>r.json()).then(d=>{
+    omsg.textContent=d.ok?('✓ '+(d.mode==='deep'?'deep scan':'quick pulse')+
+      ' queued — the light comes on within a few seconds'):'failed';
     omsg.style.color=d.ok?'var(--good)':'var(--bad)';
   }).catch(()=>{omsg.textContent='error';omsg.style.color='var(--bad)';})
-   .finally(()=>{setTimeout(()=>{omsg.textContent='';obtn.disabled=false;},7000);});
-};
+   .finally(()=>{setTimeout(()=>{omsg.textContent='';obtn.disabled=dbtn.disabled=false;},7000);});
+}
+obtn.onclick=()=>requestBurst('quick');
+dbtn.onclick=()=>requestBurst('deep');
 
 let PAGE_V=null;
 const es=new EventSource('/stream');
@@ -694,7 +827,33 @@ es.onmessage=e=>{
   // Pulse (from PPG/optics) + movement (from the accelerometer).
   const pb=document.getElementById('pulse').querySelector('b');
   pb.textContent = d.pulse!=null ? d.pulse+' bpm' : '—';
-  document.getElementById('hr').textContent = d.pulse!=null ? d.pulse : '—';
+  const V=d.vitals||{};
+  document.getElementById('hr').textContent   = V.hr!=null   ? V.hr   : '—';
+  document.getElementById('hrv').textContent  = V.hrv!=null  ? V.hrv  : '—';
+  document.getElementById('resp').textContent = V.resp!=null ? V.resp : '—';
+  // O₂ index: relative ratio-of-ratios R (higher R = lower saturation, so a rising
+  // number is a desat dip). No fake %; the label already says "relative".
+  const sp=document.getElementById('spo2'), sps=document.getElementById('spo2sub');
+  if(V.spo2 && V.spo2.R!=null){
+    spo2R.push(V.spo2.R); if(spo2R.length>120) spo2R.shift();
+    // Self-anchored relative index: 100 = this session's baseline (median of the
+    // first stable readings). Higher R = lower O₂, so the index moves DOWN on a
+    // desaturation. Uncalibrated — a relative trend, never a medical percentage.
+    const base=median(spo2R.slice(0,Math.min(20,spo2R.length)));
+    const idx=base>0?Math.round(100*base/V.spo2.R):100;
+    sp.textContent=idx;
+    const d=idx-100;
+    sps.textContent='relative · 100=baseline · R='+V.spo2.R+' · '+V.spo2.sides+
+      (V.spo2.sides===1?' side':' sides')+
+      (Math.abs(d)>=2?(d<0?' · ▼'+(-d)+' dip':' · ▲'+d):'')+' · not medical';
+  } else { spo2R=[]; sp.textContent='—';
+    sps.textContent=(V.spo2&&V.spo2.reason)?V.spo2.reason:'relative · uncalibrated'; }
+  // Pulse signal quality + which optics channels the live burst actually carries.
+  const sqi=document.getElementById('sqi');
+  sqi.textContent = V.sqi!=null ? V.sqi : '—';
+  sqi.className = V.sqi!=null ? (V.sqi>=0.6?'good':(V.sqi>=0.3?'':'warn')) : '';
+  document.getElementById('optch').textContent =
+    V.live && V.nch ? (V.nch+'-ch'+(V.channels&&V.channels.some(x=>x.includes('_RED'))?' (red ✓)':' (no red)')) : 'off';
   const mv=d.movement||{level:null,label:'—'};
   document.getElementById('mv').textContent = mv.label;
   document.getElementById('mvsub').textContent = mv.level!=null ? ('σ '+mv.level+' g') : '';
@@ -782,11 +941,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": bool(entry), "entry": entry},
                               200 if entry else 400)
         if self.path.startswith("/optics"):
-            # Ask the recorder for one optics burst (LEDs on, heart rate) on its
-            # next segment. It clears the flag when it starts the burst.
+            # Ask the recorder for one optics burst (LEDs on, live vitals). The mode
+            # word picks the preset: 'quick' = dim (HR/HRV/respiration), 'deep' =
+            # bright 16-ch (adds the O₂ index, more battery). The recorder ends the
+            # current segment early and clears the flag when it starts the burst.
+            q = urllib.parse.urlparse(self.path).query
+            mode = urllib.parse.parse_qs(q).get("mode", ["quick"])[0]
+            mode = "deep" if mode == "deep" else "quick"
             try:
-                open(OPTICS_REQ_PATH, "w").close()
-                return self._json({"ok": True})
+                with open(OPTICS_REQ_PATH, "w", encoding="utf-8") as f:
+                    f.write(mode)
+                return self._json({"ok": True, "mode": mode})
             except OSError:
                 return self._json({"ok": False}, 500)
         self.send_response(404)
