@@ -44,17 +44,17 @@ CHANNEL_LABELS = {"TP9": "left ear", "AF7": "left forehead",
 RAWDIR = os.path.expanduser("~/recordings/raw")
 RECDIR = os.path.expanduser("~/recordings")
 TAIL_BYTES = 131072                # only ever read the last 128 KB of the raw file
-# How often to re-tail and decode. The useful floor is the BLE packet rate
-# (~14-20 EEG notifications/sec) and OpenMuse's file flushing — polling faster
-# than that just re-reads the same bytes. 0.15s (~7 Hz) sits near that ceiling.
-POLL_SEC = float(os.environ.get("POLL_SEC", "0.15"))
+# How often to re-tail and decode. With OpenMuse line-buffered (install-athena.sh
+# patches it), data lands in the file ~10x/sec, so 0.1s keeps the view genuinely
+# live. Without that patch OpenMuse only flushes ~1x/sec and this can't help.
+POLL_SEC = float(os.environ.get("POLL_SEC", "0.1"))
 
 BUFFER_SEC = 12.0                  # rolling window kept in memory
 DISPLAY_HZ = 51.2                  # decimated rate sent to the browser
 DECIMATE = int(SFREQ / DISPLAY_HZ)  # 5 -> 51.2 Hz, plenty for a visual trace
-FRAME_HZ = 10                      # SSE frames per second (data updates ~7 Hz;
+FRAME_HZ = 12                      # SSE frames per second (data now lands ~10 Hz;
 #                                    20 fps of full traces was heavy on mobile and
-#                                    dropped the SSE connection — 10 is plenty)
+#                                    dropped the SSE connection — 12 matches the data)
 QUALITY_SEC = 2.0                  # window for contact quality
 BAND_SEC = 4.0                     # window for band power
 

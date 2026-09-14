@@ -83,6 +83,17 @@ else
     ok "OpenMuse installed"
 fi
 
+# Line-buffer OpenMuse's raw-file writes. Stock OpenMuse opens the outfile with
+# default (8 KB) buffering and only flushes at the end, so during recording data
+# only reaches disk ~1x/sec — which capped the live status page at ~1 update/sec.
+# buffering=1 flushes every notification line (~10x/sec) for a genuinely live view.
+# Idempotent; re-applied here because a pip reinstall reverts it.
+REC="$("${VENV}/bin/python" -c 'import OpenMuse,os;print(os.path.join(os.path.dirname(OpenMuse.__file__),"record.py"))')"
+if [[ -f "${REC}" ]] && grep -q 'open(outfile, "a", encoding="utf-8")' "${REC}"; then
+    sed -i 's/open(outfile, "a", encoding="utf-8")/open(outfile, "a", encoding="utf-8", buffering=1)/' "${REC}"
+    ok "line-buffered OpenMuse raw writes (live status page)"
+fi
+
 bold "Bluetooth sudoers (hciconfig without a password)"
 SUDOERS=/etc/sudoers.d/muse
 if sudo test -f "${SUDOERS}" && sudo grep -q "hciconfig" "${SUDOERS}"; then
