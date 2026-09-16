@@ -6,13 +6,21 @@
 #   3. On the Pi:   bash install.sh
 #
 # Provisions the venv + OpenMuse, the recorder, the live status page, and the
-# Samba share the analysis server reads from — then verifies it. Supply the
-# Athena's MAC and the Samba password up front to run unattended:
+# Samba share the analysis server reads from — then verifies it. Interactive: it
+# asks which Bluetooth radio to use (USB dongle or onboard), the headband MAC,
+# and the Samba password, then goes down the line and sets everything up.
 #
-#   MUSE_MAC=00:55:DA:.. SMB_PASSWORD=secret bash install.sh
+# Run unattended by supplying the answers up front:
 #
-# The MAC is optional: leave it blank and the recorder discovers the band with
-# `OpenMuse find` at run time. Idempotent — safe to re-run.
+#   BT=usb MUSE_MAC=00:55:DA:.. SMB_PASSWORD=secret bash install.sh
+#
+#   BT=usb|onboard  which Bluetooth radio to record with. 'usb' disables the
+#                   onboard radio so a USB dongle becomes hci0 and REBOOTS at the
+#                   end to activate it (non-interactive reboots automatically).
+#   MUSE_MAC        optional: leave blank and the recorder discovers the band
+#                   with `OpenMuse find` at run time.
+#
+# Idempotent — safe to re-run; switching BT back to onboard undoes the dongle.
 
 set -euo pipefail
 
@@ -61,16 +69,59 @@ else
 fi
 
 # A USB BLE dongle bypasses the onboard UART radio entirely (where frame
-# corruption happens) and is the fix if overnight drops persist.
-if lsusb 2>/dev/null | grep -qi bluetooth; then
-    ok "USB Bluetooth dongle detected — to make it the only adapter:"
-    echo "       echo 'dtoverlay=disable-bt' | sudo tee -a /boot/firmware/config.txt && sudo reboot"
-else
-    echo "   onboard Bluetooth (no USB dongle)"
-fi
+# corruption happens) and is the fix if overnight drops persist. The choice of
+# which radio to use is made interactively in Configuration, below.
 
 # ------------------------------------------------------------------ inputs --
 bold "Configuration"
+
+# --- 1. Bluetooth radio ---------------------------------------------------
+# WiFi and Bluetooth share one antenna on a Pi, and the onboard UART radio is
+# where overnight frame-corruption drops happen. A USB dongle is a cleaner radio
+# and can be placed (on a short extension) right next to the bed. Choosing it
+# disables the onboard radio so the dongle becomes hci0 — no code changes, the
+# recorder already targets hci0 — which needs one reboot to take effect.
+BT_CHOICE="${BT:-}"                       # env 'usb'|'onboard' preselects (unattended)
+HAS_DONGLE=0
+lsusb 2>/dev/null | grep -qiE 'bluetooth' && HAS_DONGLE=1
+echo "   Which Bluetooth radio should record the headband?"
+if [[ "${HAS_DONGLE}" -eq 1 ]]; then
+    echo "   (a USB Bluetooth dongle is plugged in)"
+else
+    echo "   (no USB dongle detected right now — you can still pick it and plug in before the reboot)"
+fi
+echo "     1) USB dongle  — recommended: cleaner radio, place near the bed; needs a reboot"
+echo "     2) Onboard     — the Pi's built-in Bluetooth"
+if [[ -z "${BT_CHOICE}" ]]; then
+    BT_DEF=$([[ "${HAS_DONGLE}" -eq 1 ]] && echo 1 || echo 2)
+    read -rp "   choose [${BT_DEF}]: " BT_ANS; BT_ANS="${BT_ANS:-$BT_DEF}"
+    [[ "${BT_ANS}" == "1" ]] && BT_CHOICE=usb || BT_CHOICE=onboard
+fi
+
+REBOOT_NEEDED=0
+if [[ "${BT_CHOICE}" == "usb" ]]; then
+    [[ "${HAS_DONGLE}" -eq 1 ]] || warn "no dongle seen yet — plug it in before rebooting"
+    CFG=/boot/firmware/config.txt; [[ -f "${CFG}" ]] || CFG=/boot/config.txt
+    [[ -f "${CFG}" ]] || die "cannot find config.txt to configure the dongle"
+    sudo cp -n "${CFG}" "${CFG}.pre-dongle" 2>/dev/null || true
+    if ! grep -q '^dtoverlay=disable-bt' "${CFG}"; then
+        printf '\n# Muse installer: disable onboard Bluetooth so the USB dongle is hci0\ndtoverlay=disable-bt\n' \
+            | sudo tee -a "${CFG}" >/dev/null
+    fi
+    command -v rfkill >/dev/null 2>&1 && sudo rfkill unblock bluetooth 2>/dev/null || true
+    REBOOT_NEEDED=1
+    ok "USB dongle selected — onboard radio disabled; a reboot at the end makes it hci0"
+else
+    # Undo a previous dongle setup if the user is switching back to onboard.
+    for CFG in /boot/firmware/config.txt /boot/config.txt; do
+        [[ -f "${CFG}" ]] && grep -q '^dtoverlay=disable-bt' "${CFG}" \
+            && { sudo sed -i '/^dtoverlay=disable-bt$/d' "${CFG}"; REBOOT_NEEDED=1
+                 warn "re-enabled onboard Bluetooth — a reboot is needed to restore it"; }
+    done
+    ok "onboard Bluetooth selected"
+fi
+
+# --- 2. Headband MAC ------------------------------------------------------
 # The Athena MAC is optional — the recorder can discover it with `OpenMuse find`.
 MUSE_MAC="${MUSE_MAC:-}"
 if [[ -n "${MUSE_MAC}" ]]; then
@@ -80,6 +131,7 @@ else
     warn "no MAC given — the recorder will discover the band at run time (fine)"
 fi
 
+# --- 3. Samba password ----------------------------------------------------
 # Samba serves the recordings to the analysis host. Matching the password the
 # analysis host already stores means its mount config needs no changes.
 SMB_PASSWORD="${SMB_PASSWORD:-}"
@@ -142,6 +194,42 @@ STATUS_PORT="${STATUS_PORT}" VENV="${VENV}" bash "${HERE}/install-status.sh" >/d
     && ok "installed on :${STATUS_PORT}" \
     || warn "status page install failed — recorder is unaffected, retry: bash install-status.sh"
 
+IP="$(hostname -I | awk '{print $1}')"
+
+# When the USB dongle was chosen, the onboard radio is only disabled AFTER a
+# reboot, so hci0 is still the wrong adapter right now — don't start/verify on it.
+# Everything is installed and enabled, so it all comes up on the dongle on boot.
+if [[ "${REBOOT_NEEDED}" -eq 1 ]]; then
+    sudo systemctl enable muse-athena-record >/dev/null 2>&1 || true
+    echo "   Everything is installed and set to start on boot; a reboot activates the"
+    echo "   Bluetooth change, after which the recorder + status page start automatically."
+    if [[ "${BT_CHOICE}" == "usb" ]]; then
+        bold "Reboot required — activating the USB dongle"
+        cat <<NEXT
+
+   After it comes back (~1 min):
+     Status page   http://$(hostname).local:${STATUS_PORT}/   (or http://${IP}:${STATUS_PORT}/)
+     Verify radio  hciconfig -a          (hci0 should show  Bus: USB)
+     Watch logs    journalctl -u muse-athena-record -f
+
+   Tip: put the dongle on a short USB extension near the bed — proximity is what
+   cuts the overnight dropouts.
+
+NEXT
+    else
+        bold "Reboot required — restoring the onboard Bluetooth radio"
+        echo "   (the previous dongle setup is being undone)"
+    fi
+    if [[ -t 0 ]]; then
+        read -rp "   reboot now? [Y/n]: " R; R="${R:-Y}"
+    else
+        R=Y; echo "   non-interactive — rebooting now"
+    fi
+    [[ "${R}" =~ ^[Yy] ]] && { echo "   rebooting…"; sudo reboot; } \
+        || warn "reboot later to apply the Bluetooth change:  sudo reboot"
+    exit 0
+fi
+
 # ------------------------------------------------------------------ start --
 bold "Starting the recorder"
 sudo systemctl start muse-athena-record
@@ -160,7 +248,6 @@ check "recordings directory exists"     "test -d ${OUTDIR}"
 check "OpenMuse importable"             "${VENV}/bin/python -c 'import OpenMuse'"
 check "status page responding"          "curl -sf -o /dev/null http://localhost:${STATUS_PORT}/"
 
-IP="$(hostname -I | awk '{print $1}')"
 bold "Done"
 if [[ "${FAIL}" -eq 0 ]]; then
     echo "   Everything is up. Put the charged headband on and the recorder latches"

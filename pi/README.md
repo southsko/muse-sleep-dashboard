@@ -7,7 +7,7 @@ over SMB.
 
 | File | Purpose |
 |---|---|
-| **`install.sh`** | **Start here.** One command: venv + OpenMuse, recorder, status page, Samba share, then verifies it |
+| **`install.sh`** | **Start here.** Menu-driven: asks which Bluetooth radio to use, then sets up venv + OpenMuse, recorder, status page, Samba share, and verifies it |
 | `muse_athena_record.py` / `muse-athena-record.service` / `install-athena.sh` | The recorder (OpenMuse capture → decode → CSV) and its systemd unit |
 | `muse_status.py` / `install-status.sh` | Live status page (see below) |
 
@@ -21,16 +21,23 @@ over SMB.
 bash install.sh
 ```
 
-It prompts for the Samba password (and optionally the Athena's MAC), provisions
+It walks you down the line — **which Bluetooth radio to use** (USB dongle or
+onboard), the headband MAC (optional), the Samba password — then provisions
 everything, starts it, and runs its checks. Unattended:
 
 ```bash
-MUSE_MAC=00:55:DA:.. SMB_PASSWORD=secret bash install.sh
+BT=usb MUSE_MAC=00:55:DA:.. SMB_PASSWORD=secret bash install.sh
 ```
 
-The MAC is optional — leave it out and the recorder finds the band with
-`OpenMuse find` at run time. It is never committed to this repo; it lives in
-`~/.config/muse/athena.env`. Idempotent: re-running over a working install is safe.
+- `BT=usb` disables the onboard radio so a USB dongle becomes `hci0`, and reboots
+  at the end to activate it (see [below](#if-you-add-a-usb-bluetooth-dongle));
+  `BT=onboard` uses the Pi's built-in radio.
+- The MAC is optional — leave it out and the recorder finds the band with
+  `OpenMuse find` at run time. It is never committed to this repo; it lives in
+  `~/.config/muse/athena.env`.
+
+Idempotent: re-running over a working install is safe (and switching `BT` back to
+`onboard` undoes the dongle change).
 
 A CSV appears in `~/recordings/` within a few minutes of the charged headband
 being put on.
@@ -45,14 +52,21 @@ Bluetooth's band. `install.sh` checks this and warns loudly.
 ### If you add a USB Bluetooth dongle
 
 Better still — it bypasses the onboard UART radio entirely, where the frame
-corruption happens. Make it the only adapter:
+corruption happens, and can sit on a short USB extension right next to the bed
+(proximity is what actually cuts the dropouts).
+
+`install.sh` handles it: pick **USB dongle** at the Bluetooth prompt (or pass
+`BT=usb`) and it disables the onboard radio, makes the dongle `hci0`, and reboots
+to activate it — nothing else needs to change, because the recorder already
+targets `hci0`. The onboard config is backed up to `config.txt.pre-dongle`, so
+re-running with `BT=onboard` cleanly reverts.
+
+Equivalent by hand:
 
 ```bash
 echo 'dtoverlay=disable-bt' | sudo tee -a /boot/firmware/config.txt
 sudo reboot
 ```
-
-The dongle becomes `hci0` and nothing else needs to change.
 
 ## How the recorder works
 
