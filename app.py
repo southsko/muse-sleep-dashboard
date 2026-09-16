@@ -129,13 +129,20 @@ def baseline(rs, key):
     return statistics.median(vals) if len(vals) >= 3 else None
 
 
-def tiles(rs):
-    """Headline metrics for the most recent scored night, vs personal baseline."""
+def tiles(rs, target=None):
+    """Headline metrics for a scored night (the most recent by default, or the one
+    the day-navigator selected), each vs the personal baseline of PRIOR nights."""
     ok = scored(rs)
     if not ok:
         return []
-    latest = ok[0]
-    history = ok[1:]
+    # Locate the selected night within the newest-first scored list; its baseline
+    # is the nights older than it, so browsing back in time compares fairly.
+    idx = 0
+    if target is not None:
+        idx = next((i for i, r in enumerate(ok)
+                    if r.get("source") == target.get("source")), 0)
+    latest = ok[idx]
+    history = ok[idx + 1:]
 
     spec = [
         ("Time asleep", "TST", "min", True),
@@ -366,6 +373,31 @@ def health() -> dict:
     return info
 
 
+def nights_by_date(ok):
+    """Map each night_date to its primary scored night (the one with the most wear
+    time, since a date can hold naps/test runs alongside the real night)."""
+    by = {}
+    for r in ok:
+        d = r.get("night_date")
+        if not d:
+            continue
+        if d not in by or (r.get("wear_minutes") or 0) > (by[d].get("wear_minutes") or 0):
+            by[d] = r
+    return by
+
+
+def fragmented(r):
+    """True when Bluetooth dropouts likely shredded this night enough to make the
+    fine-grained stats (WASO, awakenings, efficiency) untrustworthy. Derived from
+    stored fields so no reprocessing is needed to flag old nights."""
+    if not r:
+        return False
+    segs = r.get("n_segments") or 1
+    gap = r.get("gap_minutes") or 0.0
+    dur = r.get("duration_minutes") or 0.0
+    return segs >= 12 or (dur > 0 and gap / dur > 0.15)
+
+
 @app.route("/")
 def overview():
     rs = rows()
@@ -373,12 +405,30 @@ def overview():
     window = request.args.get("window", "30")
     if window not in ("7", "30", "90", "all"):
         window = "30"
+
+    # Day navigator: pick which night the top panel shows. Default = newest.
+    by_date = nights_by_date(ok)
+    dates = sorted(by_date)                       # ascending
+    sel_date = request.args.get("date")
+    if not sel_date or (sel_date not in by_date and not dates):
+        sel_date = dates[-1] if dates else None
+    selected = by_date.get(sel_date)              # None if that date has no night
+    # Adjacent nights that actually have data (value comparison also handles a
+    # calendar pick that landed on an empty day).
+    prev_date = max((d for d in dates if sel_date and d < sel_date), default=None)
+    next_date = min((d for d in dates if sel_date and d > sel_date), default=None)
+
     return render_template(
         "overview.html",
         health=health(),
-        latest=ok[0] if ok else None,
+        latest=selected,
         latest_raw=rs[0] if rs else None,
-        tiles=tiles(rs),
+        tiles=tiles(rs, selected) if selected else [],
+        fragmented=fragmented(selected),
+        nav={"date": sel_date, "prev": prev_date, "next": next_date,
+             "min": dates[0] if dates else None, "max": dates[-1] if dates else None,
+             "is_latest": bool(dates) and sel_date == dates[-1],
+             "count": len(dates)},
         trends=trend_block(rs, window),
         window=window,
         n_total=len(rs),

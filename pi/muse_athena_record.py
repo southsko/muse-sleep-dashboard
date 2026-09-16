@@ -58,6 +58,12 @@ SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly segments
 STALL_SEC = int(os.environ.get("STALL_SEC", "90"))        # no growth => dead link
 POLL_SEC = int(os.environ.get("POLL_SEC", "20"))
 RETRY_SEC = int(os.environ.get("RETRY_SEC", "10"))
+# When the band is off (all day, while not worn) the link never comes up and the
+# loop would otherwise retry every RETRY_SEC forever — ~120 pointless reconnects an
+# hour that spam the journal and churn the adapter. Back off toward RETRY_MAX_SEC on
+# a run of empty attempts; the first segment with real data resets it. Capped low
+# enough that putting the band on at bedtime is still noticed within a couple minutes.
+RETRY_MAX_SEC = int(os.environ.get("RETRY_MAX_SEC", "120"))
 CONNECT_GRACE_SEC = int(os.environ.get("CONNECT_GRACE_SEC", "120"))
 KEEP_RAW = os.environ.get("KEEP_RAW", "0") == "1"         # keep raw .txt after decode
 STOP_HOUR = os.environ.get("STOP_HOUR", "").strip()       # optional: stop looping at HH:00 local
@@ -426,6 +432,10 @@ def main_loop() -> int:
     RAWDIR.mkdir(parents=True, exist_ok=True)
     _recover_orphans()   # sweep up anything a prior run left undecoded
     last_burst = 0.0     # time.time() of the last optics burst (for the schedule)
+    no_data_streak = 0   # consecutive attempts that found no band (drives backoff)
+
+    def backoff() -> int:
+        return min(RETRY_SEC * (2 ** min(no_data_streak, 6)), RETRY_MAX_SEC)
 
     while not _stop:
         _recover_orphans()   # and again each cycle (cheap when there's nothing to do)
@@ -435,7 +445,8 @@ def main_loop() -> int:
         if not MAC:
             MAC = discover_mac()
             if not MAC:
-                time.sleep(RETRY_SEC)
+                no_data_streak += 1
+                time.sleep(backoff())
                 continue
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # LOCAL wall-clock (see docstring)
@@ -467,12 +478,16 @@ def main_loop() -> int:
                                    interruptible=not burst)
 
         if size <= 0:
-            # No packets at all: the link never came up. Back off and rebuild
-            # rather than spinning empty files every few seconds.
-            log.warning("segment produced no data — link down; retrying in %ss", RETRY_SEC)
+            # No packets at all: the link never came up (band off/not worn). Back
+            # off on a run of these rather than spinning empty files every RETRY_SEC.
+            no_data_streak += 1
+            wait = backoff()
+            log.warning("segment produced no data — link down (x%d); retrying in %ss",
+                        no_data_streak, wait)
             raw_path.unlink(missing_ok=True)
-            time.sleep(RETRY_SEC)
+            time.sleep(wait)
             continue
+        no_data_streak = 0   # real data arrived — back to prompt retries
 
         try:
             n = decode_txt_to_csv(raw_path, csv_path, start_epoch)

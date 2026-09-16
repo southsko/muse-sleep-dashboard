@@ -51,7 +51,8 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 8   # v8: DC-agnostic rail check (Athena rides a ~700µV offset)
+SCHEMA_VERSION = 9   # v9: absorb dropout-flanking WAKE so a flaky link stops
+#                          reading as false awakenings (v8: DC-agnostic rail check)
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -924,6 +925,36 @@ def _expand_gaps(is_gap, guard: int) -> np.ndarray:
     return out
 
 
+def _absorb_dropout_wake(stages: list[str], max_epochs: int) -> list[str]:
+    """Reclassify short WAKE bouts that directly touch an unscored (dropout) region
+    as UNS.
+
+    When the BLE link drops and later re-settles, the epochs flanking the gap are
+    artifact-heavy and the classifier reads them as WAKE. On a night with dozens of
+    dropouts each such bout becomes a phantom awakening and pads WASO, wrecking the
+    efficiency of an otherwise fine night. A WAKE run that abuts a gap and is no
+    longer than `max_epochs` is treated as that re-settle artifact; longer wake (a
+    genuine awakening) is left untouched, so real wake still counts."""
+    if max_epochs <= 0:
+        return stages
+    stages = list(stages)
+    n = len(stages)
+    i = 0
+    while i < n:
+        if stages[i] in ("WAKE", "W"):
+            j = i
+            while j < n and stages[j] in ("WAKE", "W"):
+                j += 1
+            touches_gap = (i > 0 and stages[i - 1] == "UNS") or (j < n and stages[j] == "UNS")
+            if touches_gap and (j - i) <= max_epochs:
+                for k in range(i, j):
+                    stages[k] = "UNS"
+            i = j
+        else:
+            i += 1
+    return stages
+
+
 def load_annotations(input_dir: Path) -> list[dict]:
     """Read the recorder's annotations.jsonl — lifestyle notes the user logged from
     the live page (coffee, weed, exercise…). Returns [{night_date, ts_local, text}].
@@ -1074,6 +1105,18 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     if trimmed > 0:
         log.info("  trimmed %.1f min of artifact around %d dropouts",
                  trimmed, int(np.diff(np.asarray(is_gap, int)).clip(min=0).sum()))
+
+    # Beyond the fixed guard band, absorb any short WAKE bout still touching a gap:
+    # the re-settle artifact varies in length, and on a dropout-riddled night these
+    # are what masquerade as awakenings and crush efficiency. Real (longer) wake and
+    # wake not adjacent to a dropout are untouched.
+    absorb = int(os.environ.get("DROPOUT_WAKE_EPOCHS", "6"))    # ≤3 min flanking a gap
+    before_wake = sum(1 for s in stages if s in ("WAKE", "W"))
+    stages = _absorb_dropout_wake(stages, absorb)
+    absorbed = before_wake - sum(1 for s in stages if s in ("WAKE", "W"))
+    if absorbed:
+        log.info("  absorbed %d dropout-flanking WAKE epoch(s) that would read as "
+                 "false awakenings", absorbed)
 
     # Display in the recorder's own timezone, inferred from the filenames — not
     # the analysis container's clock (which is UTC and made every time wrong).

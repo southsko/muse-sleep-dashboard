@@ -27,15 +27,36 @@
 {% else %}
 
 <div class="panel">
-  <h2>
-    Last night
-    {% if latest %}
-      &middot; {{ latest.night_date }}
-      <span class="badge {{ latest.quality }}">{{ latest.quality.replace('-', ' ') }}</span>
-    {% else %}
-      <span class="badge failed">no scoreable night</span>
-    {% endif %}
-  </h2>
+  <div class="daynav">
+    {% if nav.prev %}<a class="daynav-btn" href="/?date={{ nav.prev }}{% if window!='30' %}&window={{ window }}{% endif %}" title="{{ nav.prev }}">←</a>
+    {% else %}<span class="daynav-btn off">←</span>{% endif %}
+    <form class="daynav-cal" method="get" action="/">
+      {% if window!='30' %}<input type="hidden" name="window" value="{{ window }}">{% endif %}
+      <input type="date" name="date" value="{{ nav.date or '' }}"
+             {% if nav.min %}min="{{ nav.min }}"{% endif %} {% if nav.max %}max="{{ nav.max }}"{% endif %}
+             onchange="this.form.submit()">
+    </form>
+    {% if nav.next %}<a class="daynav-btn" href="/?date={{ nav.next }}{% if window!='30' %}&window={{ window }}{% endif %}" title="{{ nav.next }}">→</a>
+    {% else %}<span class="daynav-btn off">→</span>{% endif %}
+    {% if not nav.is_latest and nav.max %}<a class="daynav-latest" href="/{% if window!='30' %}?window={{ window }}{% endif %}">latest ⇥</a>{% endif %}
+    <span class="daynav-title">
+      {% if latest %}
+        {{ latest.night_date }}
+        <span class="badge {{ latest.quality }}">{{ latest.quality.replace('-', ' ') }}</span>
+      {% elif nav.date %}
+        <span class="empty">no recording on {{ nav.date }}</span>
+      {% else %}
+        <span class="badge failed">no scoreable night</span>
+      {% endif %}
+    </span>
+  </div>
+
+  {% if fragmented %}
+  <p class="fragnote">⚠ This night was broken into {{ latest.n_segments }} pieces by Bluetooth
+    dropouts ({{ latest.gap_minutes|round|int }} min of gaps). Every reconnection can read as
+    a false awakening, so <b>WASO, awakenings and efficiency are unreliable here</b> — treat
+    the hypnogram shape, not the exact numbers, as the real signal.</p>
+  {% endif %}
 
   {% if latest %}
     <div class="tiles">
@@ -69,12 +90,14 @@
       &middot; staged on {{ latest.staging_channel }}
       &middot; <a href="/night/{{ latest.source }}">detail →</a>
     </p>
-  {% else %}
+  {% elif nav.is_latest and latest_raw and latest_raw.status != 'ok' %}
     <p class="empty">
       The most recent recording ({{ latest_raw.source }}) could not be scored:
       {{ latest_raw.reason or 'unknown reason' }}.
       <a href="/night/{{ latest_raw.source }}">See detail →</a>
     </p>
+  {% else %}
+    <p class="empty">Use ← → or the calendar to jump to a night that was recorded.</p>
   {% endif %}
 </div>
 

@@ -78,6 +78,20 @@ tr:hover td{background:rgba(94,176,239,.06)}
 .chip{background:var(--panel2);border:1px solid var(--line);border-radius:99px;padding:.15rem .6rem;font-size:.78rem;color:var(--muted)}
 .chip.on{color:var(--fg);border-color:var(--accent)}
 .note{color:var(--muted);font-size:.76rem;margin-top:.5rem}
+.daynav{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.9rem}
+.daynav-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;
+  border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--fg);
+  font-size:1.1rem;line-height:1;text-decoration:none;user-select:none}
+.daynav-btn:hover{border-color:var(--accent);text-decoration:none}
+.daynav-btn.off{opacity:.3;pointer-events:none}
+.daynav-cal input[type=date]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:7px;padding:.4rem .55rem;font-size:.85rem;font-family:inherit;color-scheme:dark}
+.daynav-cal input[type=date]:focus{outline:none;border-color:var(--accent)}
+.daynav-latest{font-size:.8rem;align-self:center}
+.daynav-title{font-size:.95rem;font-weight:600;letter-spacing:.02em;margin-left:.3rem}
+.fragnote{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.35);color:var(--warn);
+  border-radius:8px;padding:.6rem .8rem;margin:0 0 1rem;font-size:.82rem;line-height:1.5}
+.fragnote b{color:var(--fg)}
 .events{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.8rem;align-items:center}
 .evtlbl{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
 .evt{background:rgba(224,179,65,.12);border:1px solid rgba(224,179,65,.3);color:#e0b341;
