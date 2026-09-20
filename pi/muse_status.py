@@ -87,6 +87,8 @@ SLEEP_COMPUTE_SEC = 2.0            # recompute cadence (a Welch isn't free at fr
 SLEEP_WIN_SEC = 8.0               # EEG window for the spectral ratio
 SLEEP_SMOOTH_SEC = 90.0           # rolling window the score is averaged over
 SLEEP_ONSET_SEC = 180.0           # sustained sleep before we stamp "asleep since"
+SLEEP_MIN_SAMPLES = 5             # clean EEG windows needed before trusting a stage —
+#                                   one lucky glitch must NOT read as deep sleep
 SLEEP_ENTER = 0.60                # smoothed score to call it asleep …
 SLEEP_STAY = 0.45                 # … and to keep it (hysteresis, no flicker)
 SLEEP_DROWSY = 0.35              # below this = awake
@@ -562,9 +564,10 @@ def sleep_state(c: "Collector") -> dict:
         c.sleep_hist.append((now, slow_ratio, emg_frac, delta_dom))
 
     recent = [r for r in c.sleep_hist if now - r[0] <= SLEEP_SMOOTH_SEC]
-    if not recent:
-        # No trustworthy EEG (forehead muscle/noise). Fall back to actigraphy, like a
-        # wrist tracker: motionless in bed => asleep, low-confidence and motion-based.
+    if len(recent) < SLEEP_MIN_SAMPLES:
+        # Not enough clean EEG to trust a stage — one glitchy window is not deep
+        # sleep. Fall back to actigraphy, like a wrist tracker: motionless in bed =>
+        # asleep, low-confidence and motion-based.
         s_still = 1.0 if (mlvl is not None and mlvl < 0.03) else \
                   (0.4 if (mlvl is not None and mlvl < 0.12) else 0.5)
         held = "asleep" if s_still >= 1.0 else ("light" if s_still >= 0.4 else "awake")
@@ -1105,18 +1108,14 @@ es.onmessage=e=>{
     bw.className='battwarn';}
   else{
     const p=Math.round(d.battery);
-    const cls=p<=10?'crit':(p<=25?'low':'ok');
+    const cls=p<15?'crit':(p<30?'low':'ok');
     be.className='stat batt '+cls;be.querySelector('b').textContent=p+'%';
-    // "Charge before bed" advice is only useful BEFORE sleep — once she's down it's
-    // just a stressful alarm you can't act on. So show the banner only while awake;
-    // during sleep the quiet battery pill above is enough.
-    const preSleep = !(SL.state==='asleep' || SL.state==='drowsy');
-    if(preSleep && p<=10){bw.className='battwarn show';
-      bw.textContent='⚠ Headband battery critically low ('+p+'%). Charge it before bed — '+
-        'a low battery drops the Bluetooth link repeatedly and wrecks the recording.';}
-    else if(preSleep && p<=25){bw.className='battwarn show';
-      bw.textContent='⚠ Headband battery low ('+p+'%). Charge before bed — below ~20% '+
-        'the link starts dropping through the night.';}
+    // Charge advice only helps BEFORE bed — hide it once she's asleep (you can't act
+    // on it without ending the night). Below 15% = red box, before bed only.
+    const asleepNow=['light','deep','rem','asleep','drowsy'].includes(SL.state);
+    if(!asleepNow && p<15){bw.className='battwarn show';
+      bw.textContent='🔴 Battery '+p+'% — charge before bed. Below 15% it usually '+
+        'dies overnight and cuts the recording short.';}
     else{bw.className='battwarn';}
   }
   // Pulse (from PPG/optics) + movement (from the accelerometer).
