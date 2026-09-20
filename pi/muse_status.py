@@ -1041,7 +1041,12 @@ es.onmessage=e=>{
   document.getElementById('sleepbadge').textContent=(d.connected&&SMAP[sk])?sinfo[0]:'';
   document.getElementById('sleepbadge').style.color=scol;
   const sf=document.getElementById('sleepfill');
-  sf.style.width=(SL.score!=null?SL.score:0)+'%'; sf.style.background=scol;
+  // With no numeric EEG score (stillness fallback), fill the bar from the state so
+  // it isn't blank; dim it to signal it's a motion-based estimate, not the EEG score.
+  const stateFill={asleep:78,drowsy:45,awake:12,unknown:6};
+  const fill=(SL.score!=null)?SL.score:(stateFill[sk]!=null?stateFill[sk]:0);
+  sf.style.width=fill+'%'; sf.style.background=scol;
+  sf.style.opacity=(SL.score!=null)?'1':'0.5';
   const ssince=document.getElementById('sleepsince');
   if(SL.asleep_min!=null){const h=Math.floor(SL.asleep_min/60),m=SL.asleep_min%60;
     ssince.textContent='asleep for '+(h?h+'h ':'')+m+'m';}
@@ -1050,7 +1055,7 @@ es.onmessage=e=>{
   document.getElementById('sleepfactors').textContent = SL.score!=null
     ? ('score '+SL.score+'/100 · confidence '+SL.conf+'%  ·  slow-wave '+F.slow_ratio
        +' · muscle '+F.emg+' · '+(F.still||''))
-    : '';
+    : ('confidence '+(SL.conf!=null?SL.conf:0)+'% · '+(F.still||'')+' · '+(F.who||''));
   document.getElementById('seg').textContent=
     d.segment.name?(d.segment.name+' · '+d.segment.mb+' MB'):'no segment';
   const be=document.getElementById('batt'), bw=document.getElementById('battwarn');
@@ -1060,10 +1065,14 @@ es.onmessage=e=>{
     const p=Math.round(d.battery);
     const cls=p<=10?'crit':(p<=25?'low':'ok');
     be.className='stat batt '+cls;be.querySelector('b').textContent=p+'%';
-    if(p<=10){bw.className='battwarn show';
-      bw.textContent='⚠ Headband battery critically low ('+p+'%). Charge it now — '+
+    // "Charge before bed" advice is only useful BEFORE sleep — once she's down it's
+    // just a stressful alarm you can't act on. So show the banner only while awake;
+    // during sleep the quiet battery pill above is enough.
+    const preSleep = !(SL.state==='asleep' || SL.state==='drowsy');
+    if(preSleep && p<=10){bw.className='battwarn show';
+      bw.textContent='⚠ Headband battery critically low ('+p+'%). Charge it before bed — '+
         'a low battery drops the Bluetooth link repeatedly and wrecks the recording.';}
-    else if(p<=25){bw.className='battwarn show';
+    else if(preSleep && p<=25){bw.className='battwarn show';
       bw.textContent='⚠ Headband battery low ('+p+'%). Charge before bed — below ~20% '+
         'the link starts dropping through the night.';}
     else{bw.className='battwarn';}
