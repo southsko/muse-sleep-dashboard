@@ -1110,12 +1110,12 @@ es.onmessage=e=>{
     const p=Math.round(d.battery);
     const cls=p<15?'crit':(p<30?'low':'ok');
     be.className='stat batt '+cls;be.querySelector('b').textContent=p+'%';
-    // Charge advice only helps BEFORE bed — hide it once she's asleep (you can't act
-    // on it without ending the night). Below 15% = red box, before bed only.
-    const asleepNow=['light','deep','rem','asleep','drowsy'].includes(SL.state);
-    if(!asleepNow && p<15){bw.className='battwarn show';
-      bw.textContent='🔴 Battery '+p+'% — charge before bed. Below 15% it usually '+
-        'dies overnight and cuts the recording short.';}
+    // Below 15% = red box, ALWAYS (awake or asleep). At this level the headband is
+    // about to die and end the recording — that's worth seeing mid-night, unlike a
+    // soft "top it off" nudge which only made sense before bed.
+    if(p<15){bw.className='battwarn show';
+      bw.textContent='🔴 Battery critically low ('+p+'%) — the headband is about to '+
+        'die and the recording will stop. Plug it in if you want the rest of the night.';}
     else{bw.className='battwarn';}
   }
   // Pulse (from PPG/optics) + movement (from the accelerometer).
