@@ -830,6 +830,8 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 .sleepcol{flex:1 1 220px;min-width:180px}
 .sleepmeter{height:12px;border-radius:99px;background:#12151a;border:1px solid var(--line);overflow:hidden}
 .sleepfill{height:100%;width:0;border-radius:99px;transition:width .6s ease,background .6s ease}
+.barlabel{font-size:.72rem;color:var(--muted);margin:.35rem 0 .2rem;display:flex;justify-content:space-between}
+.barval{font-variant-numeric:tabular-nums}
 .sleepfactors{margin-top:.55rem;font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
@@ -865,7 +867,10 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
     <div class="sleeprow">
       <div id="sleepbig" class="sleepbig">—</div>
       <div class="sleepcol">
+        <div class="barlabel">🧠 EEG signal <span id="eeglvl" class="barval"></span></div>
         <div class="sleepmeter"><div id="sleepfill" class="sleepfill"></div></div>
+        <div class="barlabel">🛌 Stillness <span id="stilllvl" class="barval"></span></div>
+        <div class="sleepmeter"><div id="stillfill" class="sleepfill"></div></div>
         <div id="sleepsince" class="vsub"></div>
       </div>
     </div>
@@ -1073,13 +1078,18 @@ es.onmessage=e=>{
   sb.textContent=stxt; sb.style.color=scol;
   document.getElementById('sleepbadge').textContent=(d.connected&&SMAP[sk])?sinfo[0]:'';
   document.getElementById('sleepbadge').style.color=scol;
+  // Bar 1 — the ACTUAL EEG-based sleep signal. Empty when there's no usable EEG
+  // (then the stillness bar below is what's carrying the estimate).
   const sf=document.getElementById('sleepfill');
-  // With no numeric EEG score (stillness fallback), fill the bar from the state so
-  // it isn't blank; dim it to signal it's a motion-based estimate, not the EEG score.
-  const stateFill={asleep:78,drowsy:45,awake:12,unknown:6};
-  const fill=(SL.score!=null)?SL.score:(stateFill[sk]!=null?stateFill[sk]:0);
-  sf.style.width=fill+'%'; sf.style.background=scol;
-  sf.style.opacity=(SL.score!=null)?'1':'0.5';
+  sf.style.width=(SL.score!=null?SL.score:0)+'%'; sf.style.background=scol;
+  document.getElementById('eeglvl').textContent=(SL.score!=null)?(SL.score+'/100'):'no signal';
+  // Bar 2 — stillness from the accelerometer (independent of the EEG).
+  const mvv=d.movement||{}, lvl=mvv.level;
+  const still=(lvl==null)?0:Math.max(0,Math.min(100,Math.round(100*(1-lvl/0.15))));
+  const stf=document.getElementById('stillfill');
+  stf.style.width=still+'%';
+  stf.style.background=(still>=80?'var(--good)':(still>=40?'var(--accent)':'var(--warn)'));
+  document.getElementById('stilllvl').textContent=(mvv.label||'—')+(lvl!=null?' · '+still+'%':'');
   const ssince=document.getElementById('sleepsince');
   if(SL.asleep_min!=null){const h=Math.floor(SL.asleep_min/60),m=SL.asleep_min%60;
     ssince.textContent='asleep for '+(h?h+'h ':'')+m+'m';}
