@@ -277,8 +277,23 @@ class Collector:
         return (sum(n for _, n in pts[1:]) / span) if span > 0 else 0.0
 
 
+def _inband_std(x: np.ndarray) -> float:
+    """RMS amplitude of the real EEG band (0.5-40 Hz), via Welch — the honest
+    measure of contact. The raw µV are swamped by the Athena's DC baseline AND
+    common-mode 60 Hz mains hum (both out-of-band, and both cancelled by the bipolar
+    montage), which made a pristine electrode read as hundreds of µV of 'noise'.
+    A time-domain filter can't do this on a 2 s window (edge artefacts inflate it
+    ~50x); integrating the power spectrum over the band is robust and exact."""
+    from scipy.signal import welch
+    f, p = welch(x - x.mean(), fs=SFREQ, nperseg=min(len(x), 256))
+    m = (f >= 0.5) & (f <= 40.0)
+    return float(np.sqrt(np.trapezoid(p[m], f[m]))) if m.any() else float(np.std(x))
+
+
 def quality(arr: np.ndarray) -> dict:
-    """Per-channel contact verdict, matching the analysis pipeline's rules."""
+    """Per-channel contact verdict, judged on the in-band RMS (see _inband_std), not
+    raw µV: the raw amplitude is dominated by mains hum / DC drift, which cried
+    'noisy' at good electrodes and starved the sleep estimate of usable signal."""
     out = {}
     n = int(QUALITY_SEC * SFREQ)
     seg = arr[-n:] if len(arr) >= n else arr
@@ -286,20 +301,16 @@ def quality(arr: np.ndarray) -> dict:
         if seg.size == 0:
             out[name] = {"verdict": "no data", "std": 0.0, "railed": 0.0}
             continue
-        x = seg[:, i]
-        xc = x - np.median(x)          # DC-agnostic, like analyze.py
-        railed = float(np.mean(np.abs(xc) > RAIL_UV))
-        std = float(np.std(x))
-        if railed > RAIL_FRACTION:
-            verdict = "railed"
-        elif std < FLAT_STD_UV:
+        std = _inband_std(seg[:, i])
+        if std < FLAT_STD_UV:
             verdict = "flat"
-        elif std > 100:
+        elif std > 250:            # broadband saturation / movement storm
+            verdict = "railed"
+        elif std > 100:            # genuine in-band noise (poor contact, EMG)
             verdict = "noisy"
         else:
             verdict = "good"
-        out[name] = {"verdict": verdict, "std": round(std, 1),
-                     "railed": round(100 * railed, 1)}
+        out[name] = {"verdict": verdict, "std": round(std, 1), "railed": 0.0}
     return out
 
 
@@ -496,20 +507,14 @@ def sleep_state(c: "Collector") -> dict:
 
     seg = arr[-int(SLEEP_WIN_SEC * SFREQ):]
     idx = {ch: i for i, ch in enumerate(CHANNELS)}
-    # Choose the derivation by what's actually in contact. YASA's bipolar
-    # frontal-to-EAR is best, but the ears routinely go noisy/railed overnight, and
-    # then subtracting a railed ear injects its broadband noise into the spectrum —
-    # high EMG, low slow-wave = a FALSE "awake" on a sound-asleep person. So use the
-    # ears only when they're genuinely clean; otherwise fall back to the forehead
-    # sensors alone (calibrated AUC ~0.76 vs ~0.78 bipolar — nearly as good).
-    ears_clean = q["TP9"]["verdict"] == "good" and q["TP10"]["verdict"] == "good"
-    if ears_clean:
-        sig = ((seg[:, idx["AF7"]] - seg[:, idx["TP10"]]) +
-               (seg[:, idx["AF8"]] - seg[:, idx["TP9"]])) / 2.0
-        deriv = "bipolar"
-    else:
-        sig = (seg[:, idx["AF7"]] + seg[:, idx["AF8"]]) / 2.0
-        deriv = "frontal"
+    # The LIVE estimate uses the forehead sum (AF7+AF8). The morning pipeline's
+    # bipolar frontal-to-EAR is right for whole-night YASA (it normalises across the
+    # night), but over an 8 s live window the ear subtraction cancels this wearer's
+    # low-amplitude signal down to noise (slow-wave ratio collapses to ~0). The
+    # forehead sum keeps real amplitude, and it's what the per-wearer calibration was
+    # built on. Mains hum sits at 60 Hz — outside every band the ratio uses.
+    sig = (seg[:, idx["AF7"]] + seg[:, idx["AF8"]]) / 2.0
+    deriv = "frontal"
     sig = sig - np.median(sig)
     f, p = welch(sig, fs=SFREQ, nperseg=min(len(sig), 512))
 
@@ -552,8 +557,14 @@ def sleep_state(c: "Collector") -> dict:
     # electrode (hundreds of µV) or an artefact-dominated spectrum says nothing about
     # sleep, so it is DROPPED from the estimate rather than averaged in (its garbage
     # low-slow-wave/high-EMG would masquerade as "awake" on a sound-asleep person).
+    # Trust the sample only if the forehead is actually picking up BRAIN, not just
+    # ambient mains. A floating/lifted electrode reads a low in-band RMS (so contact
+    # "looks" fine) yet has zero delta/theta/alpha — all its power is 60 Hz and its
+    # harmonics, i.e. emg_frac near 1. So gate on both: real in-band amplitude AND a
+    # physiological (not mains-dominated) spectrum. Failing this drops to the
+    # stillness fallback rather than reading a floating electrode as "drowsy/awake".
     front_std = (q["AF7"]["std"] + q["AF8"]["std"]) / 2.0
-    reliable = front_std < 150.0 and emg_frac < 0.35
+    reliable = front_std < 150.0 and emg_frac < 0.5
     if reliable:
         c.sleep_hist.append((now, score, delta_dom))
 
@@ -600,11 +611,9 @@ def sleep_state(c: "Collector") -> dict:
             c.asleep_since = 0.0
     asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
     conf = int(round(100 * min(1.0, abs(sm - 0.475) / 0.475)))
-    # Forehead-only is wake-biased and less trustworthy than the bipolar montage —
-    # stay humble, and don't claim "deep" without the ear reference.
+    # "Deep" needs the ear reference the live estimate doesn't use, so leave it off
+    # for the forehead derivation rather than guess.
     deep = (state == "asleep" and dd_sm > 0.92 and deriv == "bipolar")
-    if deriv == "frontal":
-        conf = min(conf, 55)
 
     return done(state=state, score=round(100 * sm), conf=conf,
                 deep=deep, asleep_min=asleep_min,
