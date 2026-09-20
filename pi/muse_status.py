@@ -1114,8 +1114,8 @@ es.onmessage=e=>{
     // about to die and end the recording — that's worth seeing mid-night, unlike a
     // soft "top it off" nudge which only made sense before bed.
     if(p<15){bw.className='battwarn show';
-      bw.textContent='🔴 Battery critically low ('+p+'%) — the headband is about to '+
-        'die and the recording will stop. Plug it in if you want the rest of the night.';}
+      bw.textContent='🔴 Battery low ('+p+'%) — the headband will die soon and the '+
+        'recording will end. (Nothing to do now; can’t charge while worn.)';}
     else{bw.className='battwarn';}
   }
   // Pulse (from PPG/optics) + movement (from the accelerometer).
