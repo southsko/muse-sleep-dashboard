@@ -501,6 +501,7 @@ def sleep_state(c: "Collector") -> dict:
     if c._sleep is not None and now - c._sleep_at < SLEEP_COMPUTE_SEC:
         return c._sleep
     out = {"state": "—", "score": None, "conf": 0, "deep": False,
+           "depth": None, "stage": None,
            "asleep_min": None, "factors": {}, "reason": None}
 
     def done(**kw):
@@ -624,12 +625,18 @@ def sleep_state(c: "Collector") -> dict:
             c.asleep_since = 0.0
     asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
     conf = int(round(100 * min(1.0, abs(sm - 0.475) / 0.475)))
-    # "Deep" needs the ear reference the live estimate doesn't use, so leave it off
-    # for the forehead derivation rather than guess.
-    deep = (state == "asleep" and dd_sm > 0.92 and deriv == "bipolar")
+    # Rough sleep depth from delta-wave dominance: more slow-wave = deeper. Only
+    # meaningful while asleep, and it's LIGHT-vs-DEEP only — REM can't be told from
+    # wake on a forehead sensor (needs eye movement), so we don't claim it; the
+    # morning YASA pass owns the real stages.
+    depth = stage = None
+    if state == "asleep":
+        depth = int(max(0, min(100, (dd_sm - 0.80) / 0.15 * 100)))
+        stage = "deep" if dd_sm > 0.90 else "light"
+    deep = (state == "asleep" and dd_sm > 0.90)
 
-    return done(state=state, score=round(100 * sm), conf=conf,
-                deep=deep, asleep_min=asleep_min,
+    return done(state=state, score=round(100 * sm), conf=conf, deep=deep,
+                depth=depth, stage=stage, asleep_min=asleep_min,
                 factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
                          "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
 
@@ -871,6 +878,8 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
         <div class="sleepmeter"><div id="sleepfill" class="sleepfill"></div></div>
         <div class="barlabel">🛌 Stillness <span id="stilllvl" class="barval"></span></div>
         <div class="sleepmeter"><div id="stillfill" class="sleepfill"></div></div>
+        <div class="barlabel">🌊 Depth · light→deep <span id="depthlvl" class="barval"></span></div>
+        <div class="sleepmeter"><div id="depthfill" class="sleepfill"></div></div>
         <div id="sleepsince" class="vsub"></div>
       </div>
     </div>
@@ -1091,6 +1100,13 @@ es.onmessage=e=>{
   stf.style.width=still+'%';
   stf.style.background=(still>=80?'var(--good)':(still>=40?'var(--accent)':'var(--warn)'));
   document.getElementById('stilllvl').textContent=(mvv.label||'—')+(lvl!=null?' · '+still+'%':'');
+  // Bar 3 — sleep depth (light->deep) from delta-wave dominance. Only while asleep;
+  // REM is not detectable on a forehead sensor, so this is depth only.
+  const dpf=document.getElementById('depthfill');
+  const dep=(SL.depth!=null)?SL.depth:0;
+  dpf.style.width=dep+'%'; dpf.style.background='var(--accent)';
+  document.getElementById('depthlvl').textContent=(SL.stage)?(SL.stage+' · '+dep+'%'):
+    (sk==='asleep'?'…':'—');
   const ssince=document.getElementById('sleepsince');
   if(SL.asleep_min!=null){const h=Math.floor(SL.asleep_min/60),m=SL.asleep_min%60;
     ssince.textContent='asleep for '+(h?h+'h ':'')+m+'m';}
