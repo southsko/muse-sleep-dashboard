@@ -540,106 +540,85 @@ def sleep_state(c: "Collector") -> dict:
     slow_ratio = (d + th) / (al + be + 1e-9)
     emg_frac = emg / tot
     delta_dom = d / tot
-    # Map each cue to 0-1 against the (per-wearer) anchors, then weight.
-    cal = sleep_calib()
-    s_sw = max(0.0, min(1.0, (math.log10(slow_ratio + 1e-9) - math.log10(cal["sw_lo"])) /
-                        (math.log10(cal["sw_hi"]) - math.log10(cal["sw_lo"]))))
-    s_emg = max(0.0, min(1.0, (cal["emg_lo"] - emg_frac) / (cal["emg_lo"] - cal["emg_hi"])))
-
+    cal = sleep_calib()          # kept only for an optional wearer name in the readout
     mv = movement(c)
     mlvl = mv.get("level")
-    # Stillness as a POSITIVE cue, not just a veto. Sustained lack of movement is
-    # real evidence of sleep and is derivation-independent — which matters most
-    # exactly when the EEG is weak (forced onto the wake-biased forehead-only
-    # signal because the ears lost contact, as happens most nights).
-    if mlvl is None:    s_still = 0.5
-    elif mlvl < 0.03:   s_still = 1.0
-    elif mlvl < 0.12:   s_still = 0.4
-    else:               s_still = 0.0
-    score = cal["w_sw"] * s_sw + cal["w_emg"] * s_emg + cal["w_still"] * s_still
 
-    # Real thrashing = awake, whatever the electrodes say. This is the only thing
-    # that pulls someone OUT of sleep — a railed sensor must not.
+    # Real thrashing = awake, whatever the electrodes say — the ONLY thing that pulls
+    # someone out of sleep (a railed sensor must not).
     if mlvl is not None and mlvl > 0.12:
         c.sleep_hist.clear(); c.sleep_name = "awake"
         c.asleep_since = 0.0; c._sleep_cand = 0.0
-        return done(state="awake", score=round(100 * score), conf=60,
+        return done(state="awake", conf=65,
                     factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
                              "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
 
-    # Trust this sample only if the forehead is actually contacting: a railed/noisy
-    # electrode (hundreds of µV) or an artefact-dominated spectrum says nothing about
-    # sleep, so it is DROPPED from the estimate rather than averaged in (its garbage
-    # low-slow-wave/high-EMG would masquerade as "awake" on a sound-asleep person).
-    # Trust the sample only if the forehead is actually picking up BRAIN, not just
-    # ambient mains. A floating/lifted electrode reads a low in-band RMS (so contact
-    # "looks" fine) yet has zero delta/theta/alpha — all its power is 60 Hz and its
-    # harmonics, i.e. emg_frac near 1. So gate on both: real in-band amplitude AND a
-    # physiological (not mains-dominated) spectrum. Failing this drops to the
-    # stillness fallback rather than reading a floating electrode as "drowsy/awake".
+    # Trust the sample only if the forehead is picking up BRAIN, not ambient mains or
+    # muscle: a railed electrode or an artefact-dominated spectrum (emg_frac far above
+    # any real stage's ~0.12) says nothing about sleep — drop it, don't average it in.
     front_std = (q["AF7"]["std"] + q["AF8"]["std"]) / 2.0
-    reliable = front_std < 150.0 and emg_frac < 0.5
+    reliable = front_std < 150.0 and emg_frac < 0.35
     if reliable:
-        c.sleep_hist.append((now, score, delta_dom))
+        c.sleep_hist.append((now, slow_ratio, emg_frac, delta_dom))
 
-    recent = [(s, dd) for (t, s, dd) in c.sleep_hist if now - t <= SLEEP_SMOOTH_SEC]
+    recent = [r for r in c.sleep_hist if now - r[0] <= SLEEP_SMOOTH_SEC]
     if not recent:
-        # No trustworthy EEG in the window (the forehead is railing). Thrashing was
-        # already handled above, so fall back to actigraphy — the same thing a wrist
-        # tracker does: someone lying motionless in bed is almost certainly asleep.
-        # Labelled low-confidence and motion-based so it's clear the EEG isn't backing
-        # it, and it can never pull OUT of sleep (only real movement does that).
-        held = "asleep" if s_still >= 1.0 else ("drowsy" if s_still >= 0.4 else "awake")
-        if held == "asleep" and c.asleep_since == 0.0:
-            if c._sleep_cand == 0.0:
-                c._sleep_cand = now
-            if now - c._sleep_cand >= SLEEP_ONSET_SEC:
-                c.asleep_since = c._sleep_cand
-        if held != "awake":
-            c.sleep_name = held
+        # No trustworthy EEG (forehead muscle/noise). Fall back to actigraphy, like a
+        # wrist tracker: motionless in bed => asleep, low-confidence and motion-based.
+        s_still = 1.0 if (mlvl is not None and mlvl < 0.03) else \
+                  (0.4 if (mlvl is not None and mlvl < 0.12) else 0.5)
+        held = "asleep" if s_still >= 1.0 else ("light" if s_still >= 0.4 else "awake")
+        if held in ("asleep", "light"):
+            if c.asleep_since == 0.0:
+                if c._sleep_cand == 0.0:
+                    c._sleep_cand = now
+                if now - c._sleep_cand >= SLEEP_ONSET_SEC:
+                    c.asleep_since = c._sleep_cand
+        else:
+            c._sleep_cand = 0.0; c.asleep_since = 0.0
+        c.sleep_name = held
         asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
-        return done(state=held, score=None, conf=25, asleep_min=asleep_min,
-                    depth=(15 if held == "asleep" else None),
-                    stage=("light?" if held == "asleep" else None),
-                    reason="EEG buried in muscle/noise this moment — going by stillness",
+        return done(state=held, conf=25, asleep_min=asleep_min,
+                    depth=(20 if held != "awake" else None),
+                    reason="EEG buried in muscle/noise — going by stillness",
                     factors={"slow_ratio": None, "emg": None,
                              "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
-    sm = float(np.mean([s for s, _ in recent]))
-    dd_sm = float(np.mean([dd for _, dd in recent]))
 
-    # Hysteresis: harder to fall asleep than to stay asleep.
-    if c.sleep_name == "asleep":
-        state = "asleep" if sm >= cal["stay"] else ("awake" if sm < cal["drowsy"] else "drowsy")
+    # Smoothed features (~90 s; stages last minutes, single 8 s windows are noisy),
+    # classified with the UNIVERSAL thresholds derived from real YASA-staged nights:
+    #   slow-wave content sets depth (N3 deep vs N2 light); among low-slow-wave epochs,
+    #   muscle atonia (low EMG) marks REM vs wake. Deep is reliable (~78% vs YASA);
+    #   REM is a LOW-confidence flag only (~29% live — it overlaps wake/light on a
+    #   forehead sensor); the morning YASA pass owns the real staging.
+    slow_s = float(np.median([r[1] for r in recent]))
+    emg_s = float(np.median([r[2] for r in recent]))
+    if slow_s >= 12.0:
+        state = "deep"
+    elif slow_s >= 4.0:
+        state = "light"
+    elif emg_s < 0.10:
+        state = "rem"                     # low slow-wave + atonia -> possible dreaming
     else:
-        state = "asleep" if sm >= cal["enter"] else ("awake" if sm < cal["drowsy"] else "drowsy")
+        state = "awake"
     c.sleep_name = state
 
-    # Onset/offset: stamp "asleep since" only after sustained sleep; clear on wake.
-    if state == "asleep":
+    if state in ("light", "deep", "rem"):
         if c.asleep_since == 0.0:
             if c._sleep_cand == 0.0:
                 c._sleep_cand = now
             if now - c._sleep_cand >= SLEEP_ONSET_SEC:
                 c.asleep_since = c._sleep_cand
     else:
-        c._sleep_cand = 0.0
-        if state == "awake":
-            c.asleep_since = 0.0
+        c._sleep_cand = 0.0; c.asleep_since = 0.0
     asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
-    conf = int(round(100 * min(1.0, abs(sm - 0.475) / 0.475)))
-    # Rough sleep depth from delta-wave dominance: more slow-wave = deeper. Only
-    # meaningful while asleep, and it's LIGHT-vs-DEEP only — REM can't be told from
-    # wake on a forehead sensor (needs eye movement), so we don't claim it; the
-    # morning YASA pass owns the real stages.
-    depth = stage = None
-    if state == "asleep":
-        depth = int(max(0, min(100, (dd_sm - 0.80) / 0.15 * 100)))
-        stage = "deep" if dd_sm > 0.90 else "light"
-    deep = (state == "asleep" and dd_sm > 0.90)
 
-    return done(state=state, score=round(100 * sm), conf=conf, deep=deep,
-                depth=depth, stage=stage, asleep_min=asleep_min,
+    depth = int(max(0, min(100, (math.log10(max(slow_s, 1e-3)) - math.log10(2.0)) /
+                           (math.log10(20.0) - math.log10(2.0)) * 100)))
+    conf = {"deep": 80, "awake": 65, "light": 60, "rem": 35}.get(state, 40)
+    return done(state=state, conf=conf, deep=(state == "deep"),
+                depth=depth, stage=state, asleep_min=asleep_min,
                 factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
+                         "slow_smooth": round(slow_s, 1),
                          "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
 
 
@@ -1080,21 +1059,22 @@ es.onmessage=e=>{
   document.getElementById('hz').textContent='· '+d.display_hz+' Hz shown';
   // Live sleep-state estimate.
   const SL=d.sleep||{};
-  const SMAP={awake:['👁 Awake','var(--warn)'],drowsy:['😌 Drowsy','var(--accent)'],
-    asleep:['💤 Asleep','var(--good)'],unknown:['🤔 Can’t tell','var(--muted)']};
+  const SMAP={awake:['👁 Awake','var(--warn)'],light:['🌙 Light sleep','var(--accent)'],
+    deep:['💤 Deep sleep','var(--good)'],rem:['🌀 REM? · dreaming','#b98cff'],
+    asleep:['😴 Asleep','var(--good)'],drowsy:['😌 Drowsy','var(--accent)'],
+    unknown:['🤔 Can’t tell','var(--muted)']};
   let sk=SL.state, sinfo=SMAP[sk]||['—','var(--muted)'];
   let stxt=sinfo[0], scol=sinfo[1];
-  if(SL.deep && sk==='asleep'){stxt='💤 Asleep · deep';}
   const sb=document.getElementById('sleepbig');
   sb.textContent=stxt; sb.style.color=scol;
   document.getElementById('sleepbadge').textContent=(d.connected&&SMAP[sk])?sinfo[0]:'';
   document.getElementById('sleepbadge').style.color=scol;
-  // Bar 1 — the sleep status itself (how asleep). Uses the EEG score when there is
-  // one, else fills from the state so a stillness-based "asleep" still shows.
+  // Bar 1 — the sleep status. Fills from the stage (awake→deep is the depth axis).
   const sf=document.getElementById('sleepfill');
-  const stateFill={asleep:85,drowsy:50,awake:15,unknown:8};
-  sf.style.width=((SL.score!=null)?SL.score:(stateFill[sk]||0))+'%'; sf.style.background=scol;
-  document.getElementById('eeglvl').textContent={awake:'Awake',drowsy:'Drowsy',asleep:'Asleep',unknown:'—'}[sk]||'—';
+  const stateFill={awake:12,drowsy:45,rem:55,light:60,asleep:70,deep:92,unknown:8};
+  sf.style.width=(stateFill[sk]||0)+'%'; sf.style.background=scol;
+  document.getElementById('eeglvl').textContent=
+    {awake:'Awake',light:'Light',deep:'Deep',rem:'REM?',asleep:'Asleep',drowsy:'Drowsy',unknown:'—'}[sk]||'—';
   // Bar 2 — stillness from the accelerometer (independent of the EEG).
   const mvv=d.movement||{}, lvl=mvv.level;
   const still=(lvl==null)?0:Math.max(0,Math.min(100,Math.round(100*(1-lvl/0.15))));
@@ -1107,8 +1087,8 @@ es.onmessage=e=>{
   const dpf=document.getElementById('depthfill');
   const dep=(SL.depth!=null)?SL.depth:0;
   dpf.style.width=dep+'%'; dpf.style.background='var(--accent)';
-  document.getElementById('depthlvl').textContent=(SL.stage)?(SL.stage+' · '+dep+'%'):
-    (sk==='asleep'?'…':'—');
+  document.getElementById('depthlvl').textContent=(SL.depth!=null)?
+    ((SL.depth>=70?'deep':(SL.depth>=35?'light':'shallow'))+' · '+dep+'%'):'—';
   const ssince=document.getElementById('sleepsince');
   if(SL.asleep_min!=null){const h=Math.floor(SL.asleep_min/60),m=SL.asleep_min%60;
     ssince.textContent='asleep for '+(h?h+'h ':'')+m+'m';}
