@@ -91,6 +91,31 @@ SLEEP_ENTER = 0.60                # smoothed score to call it asleep …
 SLEEP_STAY = 0.45                 # … and to keep it (hysteresis, no flicker)
 SLEEP_DROWSY = 0.35              # below this = awake
 
+# Per-wearer calibration. The generic thresholds were tuned on one night's YASA
+# staging; a given person's band/fit/contact shifts where their "asleep" cluster
+# sits (especially forehead-only, when their ears rail). Drop a JSON here — from a
+# labelled capture of them actually asleep — to retune anchors/weights/thresholds
+# to that wearer; absent or unreadable → the generic defaults below. Reloaded ~10s
+# so an update takes effect without restarting.
+SLEEP_CALIB_PATH = os.path.join(RECDIR, ".sleep_calib.json")
+_CALIB = {"val": None, "at": 0.0}
+
+
+def sleep_calib() -> dict:
+    now = time.time()
+    if _CALIB["val"] is not None and now - _CALIB["at"] < 10.0:
+        return _CALIB["val"]
+    cal = {"name": None, "sw_lo": 3.0, "sw_hi": 20.0, "emg_lo": 0.10, "emg_hi": 0.01,
+           "w_sw": 0.5, "w_emg": 0.3, "w_still": 0.2,
+           "enter": SLEEP_ENTER, "stay": SLEEP_STAY, "drowsy": SLEEP_DROWSY}
+    try:
+        with open(SLEEP_CALIB_PATH, encoding="utf-8") as f:
+            cal.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    _CALIB["val"], _CALIB["at"] = cal, now
+    return cal
+
 # The Athena's optics (fNIRS/PPG) and IMU are on the same BLE stream, so the page
 # can show heart rate and movement "for free" from data already arriving — the
 # silver lining of not being able to turn the optics LEDs off.
@@ -493,10 +518,11 @@ def sleep_state(c: "Collector") -> dict:
     slow_ratio = (d + th) / (al + be + 1e-9)
     emg_frac = emg / tot
     delta_dom = d / tot
-    # Map each cue to 0-1 (calibrated), then weight (slow-wave carries more).
-    s_sw = max(0.0, min(1.0, (math.log10(slow_ratio + 1e-9) - math.log10(3)) /
-                        (math.log10(20) - math.log10(3))))
-    s_emg = max(0.0, min(1.0, (0.10 - emg_frac) / (0.10 - 0.01)))
+    # Map each cue to 0-1 against the (per-wearer) anchors, then weight.
+    cal = sleep_calib()
+    s_sw = max(0.0, min(1.0, (math.log10(slow_ratio + 1e-9) - math.log10(cal["sw_lo"])) /
+                        (math.log10(cal["sw_hi"]) - math.log10(cal["sw_lo"]))))
+    s_emg = max(0.0, min(1.0, (cal["emg_lo"] - emg_frac) / (cal["emg_lo"] - cal["emg_hi"])))
 
     mv = movement(c)
     mlvl = mv.get("level")
@@ -508,7 +534,7 @@ def sleep_state(c: "Collector") -> dict:
     elif mlvl < 0.03:   s_still = 1.0
     elif mlvl < 0.12:   s_still = 0.4
     else:               s_still = 0.0
-    score = 0.5 * s_sw + 0.3 * s_emg + 0.2 * s_still
+    score = cal["w_sw"] * s_sw + cal["w_emg"] * s_emg + cal["w_still"] * s_still
     if mlvl is not None and mlvl > 0.12:      # real thrashing overrides everything
         score = min(score, 0.25)
 
@@ -519,9 +545,9 @@ def sleep_state(c: "Collector") -> dict:
 
     # Hysteresis: harder to fall asleep than to stay asleep.
     if c.sleep_name == "asleep":
-        state = "asleep" if sm >= SLEEP_STAY else ("awake" if sm < SLEEP_DROWSY else "drowsy")
+        state = "asleep" if sm >= cal["stay"] else ("awake" if sm < cal["drowsy"] else "drowsy")
     else:
-        state = "asleep" if sm >= SLEEP_ENTER else ("awake" if sm < SLEEP_DROWSY else "drowsy")
+        state = "asleep" if sm >= cal["enter"] else ("awake" if sm < cal["drowsy"] else "drowsy")
     c.sleep_name = state
 
     # Onset/offset: stamp "asleep since" only after sustained sleep; clear on wake.
@@ -546,7 +572,7 @@ def sleep_state(c: "Collector") -> dict:
     return done(state=state, score=round(100 * sm), conf=conf,
                 deep=deep, asleep_min=asleep_min,
                 factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
-                         "still": mv.get("label"), "deriv": deriv})
+                         "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
 
 
 _MAINS = {"val": {"hz": None, "pct": 0.0}, "at": 0.0}
