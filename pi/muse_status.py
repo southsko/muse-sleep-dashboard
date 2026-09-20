@@ -468,11 +468,22 @@ def sleep_state(c: "Collector") -> dict:
 
     seg = arr[-int(SLEEP_WIN_SEC * SFREQ):]
     idx = {ch: i for i, ch in enumerate(CHANNELS)}
-    # Bipolar frontal-to-ear, the derivation YASA stages on.
-    bip = ((seg[:, idx["AF7"]] - seg[:, idx["TP10"]]) +
-           (seg[:, idx["AF8"]] - seg[:, idx["TP9"]])) / 2.0
-    bip = bip - np.median(bip)
-    f, p = welch(bip, fs=SFREQ, nperseg=min(len(bip), 512))
+    # Choose the derivation by what's actually in contact. YASA's bipolar
+    # frontal-to-EAR is best, but the ears routinely go noisy/railed overnight, and
+    # then subtracting a railed ear injects its broadband noise into the spectrum —
+    # high EMG, low slow-wave = a FALSE "awake" on a sound-asleep person. So use the
+    # ears only when they're genuinely clean; otherwise fall back to the forehead
+    # sensors alone (calibrated AUC ~0.76 vs ~0.78 bipolar — nearly as good).
+    ears_clean = q["TP9"]["verdict"] == "good" and q["TP10"]["verdict"] == "good"
+    if ears_clean:
+        sig = ((seg[:, idx["AF7"]] - seg[:, idx["TP10"]]) +
+               (seg[:, idx["AF8"]] - seg[:, idx["TP9"]])) / 2.0
+        deriv = "bipolar"
+    else:
+        sig = (seg[:, idx["AF7"]] + seg[:, idx["AF8"]]) / 2.0
+        deriv = "frontal"
+    sig = sig - np.median(sig)
+    f, p = welch(sig, fs=SFREQ, nperseg=min(len(sig), 512))
 
     def band(lo, hi):
         m = (f >= lo) & (f < hi)
@@ -486,11 +497,19 @@ def sleep_state(c: "Collector") -> dict:
     s_sw = max(0.0, min(1.0, (math.log10(slow_ratio + 1e-9) - math.log10(3)) /
                         (math.log10(20) - math.log10(3))))
     s_emg = max(0.0, min(1.0, (0.10 - emg_frac) / (0.10 - 0.01)))
-    score = 0.6 * s_sw + 0.4 * s_emg
 
     mv = movement(c)
     mlvl = mv.get("level")
-    if mlvl is not None and mlvl > 0.12:      # real thrashing = awake, override EEG
+    # Stillness as a POSITIVE cue, not just a veto. Sustained lack of movement is
+    # real evidence of sleep and is derivation-independent — which matters most
+    # exactly when the EEG is weak (forced onto the wake-biased forehead-only
+    # signal because the ears lost contact, as happens most nights).
+    if mlvl is None:    s_still = 0.5
+    elif mlvl < 0.03:   s_still = 1.0
+    elif mlvl < 0.12:   s_still = 0.4
+    else:               s_still = 0.0
+    score = 0.5 * s_sw + 0.3 * s_emg + 0.2 * s_still
+    if mlvl is not None and mlvl > 0.12:      # real thrashing overrides everything
         score = min(score, 0.25)
 
     c.sleep_hist.append((now, score, delta_dom))
@@ -518,11 +537,16 @@ def sleep_state(c: "Collector") -> dict:
             c.asleep_since = 0.0
     asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
     conf = int(round(100 * min(1.0, abs(sm - 0.475) / 0.475)))
+    # Forehead-only is wake-biased and less trustworthy than the bipolar montage —
+    # stay humble, and don't claim "deep" without the ear reference.
+    deep = (state == "asleep" and dd_sm > 0.92 and deriv == "bipolar")
+    if deriv == "frontal":
+        conf = min(conf, 55)
 
     return done(state=state, score=round(100 * sm), conf=conf,
-                deep=(state == "asleep" and dd_sm > 0.92), asleep_min=asleep_min,
+                deep=deep, asleep_min=asleep_min,
                 factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
-                         "still": mv.get("label")})
+                         "still": mv.get("label"), "deriv": deriv})
 
 
 _MAINS = {"val": {"hz": None, "pct": 0.0}, "at": 0.0}
