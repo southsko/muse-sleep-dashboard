@@ -599,7 +599,9 @@ def sleep_state(c: "Collector") -> dict:
             c.sleep_name = held
         asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
         return done(state=held, score=None, conf=25, asleep_min=asleep_min,
-                    reason="no EEG (forehead contact) — estimated from stillness",
+                    depth=(15 if held == "asleep" else None),
+                    stage=("light?" if held == "asleep" else None),
+                    reason="EEG buried in muscle/noise this moment — going by stillness",
                     factors={"slow_ratio": None, "emg": None,
                              "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
     sm = float(np.mean([s for s, _ in recent]))
