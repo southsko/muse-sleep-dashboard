@@ -867,7 +867,7 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
     <div class="sleeprow">
       <div id="sleepbig" class="sleepbig">—</div>
       <div class="sleepcol">
-        <div class="barlabel">🧠 EEG signal <span id="eeglvl" class="barval"></span></div>
+        <div class="barlabel">😴 Sleep <span id="eeglvl" class="barval"></span></div>
         <div class="sleepmeter"><div id="sleepfill" class="sleepfill"></div></div>
         <div class="barlabel">🛌 Stillness <span id="stilllvl" class="barval"></span></div>
         <div class="sleepmeter"><div id="stillfill" class="sleepfill"></div></div>
@@ -1078,11 +1078,12 @@ es.onmessage=e=>{
   sb.textContent=stxt; sb.style.color=scol;
   document.getElementById('sleepbadge').textContent=(d.connected&&SMAP[sk])?sinfo[0]:'';
   document.getElementById('sleepbadge').style.color=scol;
-  // Bar 1 — the ACTUAL EEG-based sleep signal. Empty when there's no usable EEG
-  // (then the stillness bar below is what's carrying the estimate).
+  // Bar 1 — the sleep status itself (how asleep). Uses the EEG score when there is
+  // one, else fills from the state so a stillness-based "asleep" still shows.
   const sf=document.getElementById('sleepfill');
-  sf.style.width=(SL.score!=null?SL.score:0)+'%'; sf.style.background=scol;
-  document.getElementById('eeglvl').textContent=(SL.score!=null)?(SL.score+'/100'):'no signal';
+  const stateFill={asleep:85,drowsy:50,awake:15,unknown:8};
+  sf.style.width=((SL.score!=null)?SL.score:(stateFill[sk]||0))+'%'; sf.style.background=scol;
+  document.getElementById('eeglvl').textContent={awake:'Awake',drowsy:'Drowsy',asleep:'Asleep',unknown:'—'}[sk]||'—';
   // Bar 2 — stillness from the accelerometer (independent of the EEG).
   const mvv=d.movement||{}, lvl=mvv.level;
   const still=(lvl==null)?0:Math.max(0,Math.min(100,Math.round(100*(1-lvl/0.15))));
