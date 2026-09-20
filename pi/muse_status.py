@@ -277,6 +277,19 @@ class Collector:
         return (sum(n for _, n in pts[1:]) / span) if span > 0 else 0.0
 
 
+def _notch_mains(x: np.ndarray) -> np.ndarray:
+    """Remove 60 and 50 Hz mains hum. On this rig the hum is ~570µV — ~70x the real
+    EEG — so it must come out before any band analysis or it swamps everything."""
+    from scipy.signal import iirnotch, filtfilt
+    try:
+        for f0 in (60.0, 50.0):
+            b, a = iirnotch(f0, 30.0, SFREQ)
+            x = filtfilt(b, a, x)
+    except ValueError:
+        pass
+    return x
+
+
 def _inband_std(x: np.ndarray) -> float:
     """RMS amplitude of the real EEG band (0.5-40 Hz), via Welch — the honest
     measure of contact. The raw µV are swamped by the Athena's DC baseline AND
@@ -515,7 +528,7 @@ def sleep_state(c: "Collector") -> dict:
     # built on. Mains hum sits at 60 Hz — outside every band the ratio uses.
     sig = (seg[:, idx["AF7"]] + seg[:, idx["AF8"]]) / 2.0
     deriv = "frontal"
-    sig = sig - np.median(sig)
+    sig = _notch_mains(sig - np.median(sig))    # strip the ~570µV mains first
     f, p = welch(sig, fs=SFREQ, nperseg=min(len(sig), 512))
 
     def band(lo, hi):
@@ -689,7 +702,18 @@ def frame() -> dict:
     live = COLLECTOR.connected
     traces = {}
     if len(arr):
-        tail = arr[-int(BUFFER_SEC * SFREQ):][::DECIMATE]
+        raw_tail = arr[-int(BUFFER_SEC * SFREQ):]
+        # Anti-alias BEFORE decimating. Decimating 256->51 Hz with no filter folded the
+        # ~570µV of 60 Hz mains down to ~8.7 Hz, drawing a fake clean "alpha" wave that
+        # looked like perfect EEG. Low-pass below the display's Nyquist first so the
+        # trace shows the real sub-25 Hz brain signal, not aliased hum.
+        try:
+            from scipy.signal import butter, filtfilt
+            bl, al_ = butter(4, 20.0 / (SFREQ / 2), btype="low")
+            filt = filtfilt(bl, al_, raw_tail, axis=0)
+        except Exception:
+            filt = raw_tail
+        tail = filt[::DECIMATE]
         for i, name in enumerate(CHANNELS):
             traces[name] = [round(float(v), 1) for v in tail[:, i]]
     return {
