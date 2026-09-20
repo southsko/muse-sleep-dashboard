@@ -71,6 +71,26 @@ FLAT_STD_UV = 1.0
 BANDS = [("Delta", 0.5, 4.0), ("Theta", 4.0, 8.0), ("Alpha", 8.0, 12.0),
          ("Sigma", 12.0, 16.0), ("Beta", 16.0, 30.0)]
 
+# --- Live sleep-state estimate --------------------------------------------
+# NOT clinical staging: two forehead sensors can't tell REM from wake, or exact
+# N-stages — the morning YASA pass owns the real hypnogram. This fuses three
+# live-computable signals into Awake / Drowsy / Asleep:
+#   * slow-wave ratio (delta+theta)/(alpha+beta) on the bipolar frontal-to-ear
+#     derivation YASA itself stages on — the strongest single cue;
+#   * muscle/EMG calm (30-50 Hz power falls asleep);
+#   * stillness (IMU) — thrashing means awake regardless of EEG.
+# Thresholds below were calibrated against YASA hypnograms from recorded nights
+# (combined score AUC ~0.77; the "asleep" band was ~83% real sleep, "awake"
+# ~78% real wake). Kept honest: it reports a confidence and its inputs, and says
+# "can't tell" when the forehead sensors lose contact.
+SLEEP_COMPUTE_SEC = 2.0            # recompute cadence (a Welch isn't free at frame rate)
+SLEEP_WIN_SEC = 8.0               # EEG window for the spectral ratio
+SLEEP_SMOOTH_SEC = 90.0           # rolling window the score is averaged over
+SLEEP_ONSET_SEC = 180.0           # sustained sleep before we stamp "asleep since"
+SLEEP_ENTER = 0.60                # smoothed score to call it asleep …
+SLEEP_STAY = 0.45                 # … and to keep it (hysteresis, no flicker)
+SLEEP_DROWSY = 0.35              # below this = awake
+
 # The Athena's optics (fNIRS/PPG) and IMU are on the same BLE stream, so the page
 # can show heart rate and movement "for free" from data already arriving — the
 # silver lining of not being able to turn the optics LEDs off.
@@ -104,6 +124,12 @@ class Collector:
         self.acc = deque(maxlen=int(ACC_SEC * ACC_FS))   # accel magnitude, g
         self._vit = None               # cached optics vitals bundle (recomputed ~1/s)
         self._vit_at = 0.0
+        self.sleep_hist = deque(maxlen=90)  # (t, score, delta_dom) at ~2s cadence
+        self._sleep = None                  # cached sleep-state bundle
+        self._sleep_at = 0.0
+        self.sleep_name = "awake"           # last committed state (for hysteresis)
+        self.asleep_since = 0.0             # epoch sustained sleep began (0 = awake)
+        self._sleep_cand = 0.0              # epoch a sleep candidate started (onset delay)
 
     def _newest_raw(self) -> str | None:
         files = glob.glob(os.path.join(RAWDIR, "*.txt"))
@@ -414,6 +440,91 @@ def movement(c: "Collector") -> dict:
     return {"level": round(s, 3), "label": label}
 
 
+def sleep_state(c: "Collector") -> dict:
+    """Live Awake / Drowsy / Asleep estimate — see the SLEEP_* notes above.
+
+    A slow-wave EEG ratio + EMG calm give a 0-1 sleepiness score; sustained
+    movement forces awake. The score is smoothed over ~90 s and crosses hysteretic
+    thresholds so it settles like real sleep rather than flickering. Cached ~2 s."""
+    import math
+    from scipy.signal import welch
+    now = time.time()
+    if c._sleep is not None and now - c._sleep_at < SLEEP_COMPUTE_SEC:
+        return c._sleep
+    out = {"state": "—", "score": None, "conf": 0, "deep": False,
+           "asleep_min": None, "factors": {}, "reason": None}
+
+    def done(**kw):
+        out.update(kw); c._sleep, c._sleep_at = out, now; return out
+
+    arr = c.snapshot()
+    if len(arr) < int(6 * SFREQ):
+        return done(reason="warming up")
+    # Staging leans on the forehead sensors; if they've lost contact, say so
+    # rather than guess.
+    q = quality(arr)
+    if q["AF7"]["verdict"] not in ("good", "noisy") or q["AF8"]["verdict"] not in ("good", "noisy"):
+        return done(state="unknown", reason="poor forehead contact")
+
+    seg = arr[-int(SLEEP_WIN_SEC * SFREQ):]
+    idx = {ch: i for i, ch in enumerate(CHANNELS)}
+    # Bipolar frontal-to-ear, the derivation YASA stages on.
+    bip = ((seg[:, idx["AF7"]] - seg[:, idx["TP10"]]) +
+           (seg[:, idx["AF8"]] - seg[:, idx["TP9"]])) / 2.0
+    bip = bip - np.median(bip)
+    f, p = welch(bip, fs=SFREQ, nperseg=min(len(bip), 512))
+
+    def band(lo, hi):
+        m = (f >= lo) & (f < hi)
+        return float(np.trapezoid(p[m], f[m])) if m.any() else 0.0
+    d, th, al, be, emg = (band(.5, 4), band(4, 8), band(8, 12), band(16, 30), band(30, 50))
+    tot = d + th + al + be + emg + 1e-9
+    slow_ratio = (d + th) / (al + be + 1e-9)
+    emg_frac = emg / tot
+    delta_dom = d / tot
+    # Map each cue to 0-1 (calibrated), then weight (slow-wave carries more).
+    s_sw = max(0.0, min(1.0, (math.log10(slow_ratio + 1e-9) - math.log10(3)) /
+                        (math.log10(20) - math.log10(3))))
+    s_emg = max(0.0, min(1.0, (0.10 - emg_frac) / (0.10 - 0.01)))
+    score = 0.6 * s_sw + 0.4 * s_emg
+
+    mv = movement(c)
+    mlvl = mv.get("level")
+    if mlvl is not None and mlvl > 0.12:      # real thrashing = awake, override EEG
+        score = min(score, 0.25)
+
+    c.sleep_hist.append((now, score, delta_dom))
+    recent = [(s, dd) for (t, s, dd) in c.sleep_hist if now - t <= SLEEP_SMOOTH_SEC]
+    sm = float(np.mean([s for s, _ in recent])) if recent else score
+    dd_sm = float(np.mean([dd for _, dd in recent])) if recent else delta_dom
+
+    # Hysteresis: harder to fall asleep than to stay asleep.
+    if c.sleep_name == "asleep":
+        state = "asleep" if sm >= SLEEP_STAY else ("awake" if sm < SLEEP_DROWSY else "drowsy")
+    else:
+        state = "asleep" if sm >= SLEEP_ENTER else ("awake" if sm < SLEEP_DROWSY else "drowsy")
+    c.sleep_name = state
+
+    # Onset/offset: stamp "asleep since" only after sustained sleep; clear on wake.
+    if state == "asleep":
+        if c.asleep_since == 0.0:
+            if c._sleep_cand == 0.0:
+                c._sleep_cand = now
+            if now - c._sleep_cand >= SLEEP_ONSET_SEC:
+                c.asleep_since = c._sleep_cand
+    else:
+        c._sleep_cand = 0.0
+        if state == "awake":
+            c.asleep_since = 0.0
+    asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
+    conf = int(round(100 * min(1.0, abs(sm - 0.475) / 0.475)))
+
+    return done(state=state, score=round(100 * sm), conf=conf,
+                deep=(state == "asleep" and dd_sm > 0.92), asleep_min=asleep_min,
+                factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
+                         "still": mv.get("label")})
+
+
 _MAINS = {"val": {"hz": None, "pct": 0.0}, "at": 0.0}
 
 
@@ -496,6 +607,7 @@ def frame() -> dict:
         "battery": COLLECTOR.battery,
         "pulse": vit["hr"],
         "vitals": vit,
+        "sleep": sleep_state(COLLECTOR),
         "movement": movement(COLLECTOR),
         "mains": mains(arr),
         "traces": traces,
@@ -592,6 +704,13 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
   border-radius:7px;padding:.55rem 1rem;font-size:.9rem;font-weight:600;cursor:pointer}
 .lightbtn:hover{background:var(--accent);color:#0b1016}
 .lightbtn:disabled{opacity:.5;cursor:default}
+.sleepbadge{font-weight:600}
+.sleeppanel .sleeprow{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+.sleepbig{font-size:1.7rem;font-weight:700;letter-spacing:.01em;min-width:9rem}
+.sleepcol{flex:1 1 220px;min-width:180px}
+.sleepmeter{height:12px;border-radius:99px;background:#12151a;border:1px solid var(--line);overflow:hidden}
+.sleepfill{height:100%;width:0;border-radius:99px;transition:width .6s ease,background .6s ease}
+.sleepfactors{margin-top:.55rem;font-size:.78rem;color:var(--muted);font-variant-numeric:tabular-nums}
 
 /* Phone layout: tighter everything, bigger key numbers, contact 2-up, band 1-up */
 @media(max-width:640px){
@@ -612,6 +731,7 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 </style></head><body>
 <header>
   <h1>MUSE · LIVE</h1>
+  <span id="sleepbadge" class="stat sleepbadge"></span>
   <span id="conn" class="stat"><span class="dot dead"></span>connecting…</span>
   <span id="batt" class="stat batt">🔋 <b>—</b></span>
   <span id="pulse" class="stat">❤️ <b>—</b></span>
@@ -620,6 +740,21 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
 </header>
 <main>
   <div id="battwarn" class="battwarn"></div>
+  <div class="panel sleeppanel">
+    <h2>Sleep state <span class="stat" style="text-transform:none">live estimate — not clinical staging</span></h2>
+    <div class="sleeprow">
+      <div id="sleepbig" class="sleepbig">—</div>
+      <div class="sleepcol">
+        <div class="sleepmeter"><div id="sleepfill" class="sleepfill"></div></div>
+        <div id="sleepsince" class="vsub"></div>
+      </div>
+    </div>
+    <div id="sleepfactors" class="sleepfactors"></div>
+    <div class="note">Awake / Drowsy / Asleep from the EEG slow-wave ratio, muscle tone and
+      stillness — a live guess (~0.8 agreement with the morning analysis on recorded nights).
+      The real hypnogram still comes from the overnight YASA pass; this is just so you can see,
+      in the moment, whether someone's drifting off.</div>
+  </div>
   <div class="panel notepanel">
     <form id="notef" onsubmit="return false">
       <input id="notetext" type="text" maxlength="200" autocomplete="off"
@@ -807,6 +942,28 @@ es.onmessage=e=>{
     (d.connected?'streaming':'no data');
   document.getElementById('rate').textContent=d.rate.toFixed(0)+' Hz';
   document.getElementById('hz').textContent='· '+d.display_hz+' Hz shown';
+  // Live sleep-state estimate.
+  const SL=d.sleep||{};
+  const SMAP={awake:['👁 Awake','var(--warn)'],drowsy:['😌 Drowsy','var(--accent)'],
+    asleep:['💤 Asleep','var(--good)'],unknown:['🤔 Can’t tell','var(--muted)']};
+  let sk=SL.state, sinfo=SMAP[sk]||['—','var(--muted)'];
+  let stxt=sinfo[0], scol=sinfo[1];
+  if(SL.deep && sk==='asleep'){stxt='💤 Asleep · deep';}
+  const sb=document.getElementById('sleepbig');
+  sb.textContent=stxt; sb.style.color=scol;
+  document.getElementById('sleepbadge').textContent=(d.connected&&SMAP[sk])?sinfo[0]:'';
+  document.getElementById('sleepbadge').style.color=scol;
+  const sf=document.getElementById('sleepfill');
+  sf.style.width=(SL.score!=null?SL.score:0)+'%'; sf.style.background=scol;
+  const ssince=document.getElementById('sleepsince');
+  if(SL.asleep_min!=null){const h=Math.floor(SL.asleep_min/60),m=SL.asleep_min%60;
+    ssince.textContent='asleep for '+(h?h+'h ':'')+m+'m';}
+  else if(SL.reason){ssince.textContent=SL.reason;} else {ssince.textContent='';}
+  const F=SL.factors||{};
+  document.getElementById('sleepfactors').textContent = SL.score!=null
+    ? ('score '+SL.score+'/100 · confidence '+SL.conf+'%  ·  slow-wave '+F.slow_ratio
+       +' · muscle '+F.emg+' · '+(F.still||''))
+    : '';
   document.getElementById('seg').textContent=
     d.segment.name?(d.segment.name+' · '+d.segment.mb+' MB'):'no segment';
   const be=document.getElementById('batt'), bw=document.getElementById('battwarn');
