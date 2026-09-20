@@ -488,8 +488,11 @@ def sleep_state(c: "Collector") -> dict:
     # Staging leans on the forehead sensors; if they've lost contact, say so
     # rather than guess.
     q = quality(arr)
-    if q["AF7"]["verdict"] not in ("good", "noisy") or q["AF8"]["verdict"] not in ("good", "noisy"):
-        return done(state="unknown", reason="poor forehead contact")
+    # Only bail outright when the forehead is truly dead (flat / no data). Railed or
+    # noisy still flows through — the reliability check below decides per-sample
+    # whether to trust it, so a brief railed patch is dropped, not treated as "awake".
+    if q["AF7"]["verdict"] in ("flat", "no data") and q["AF8"]["verdict"] in ("flat", "no data"):
+        return done(state="unknown", reason="forehead sensors have no signal")
 
     seg = arr[-int(SLEEP_WIN_SEC * SFREQ):]
     idx = {ch: i for i, ch in enumerate(CHANNELS)}
@@ -535,13 +538,47 @@ def sleep_state(c: "Collector") -> dict:
     elif mlvl < 0.12:   s_still = 0.4
     else:               s_still = 0.0
     score = cal["w_sw"] * s_sw + cal["w_emg"] * s_emg + cal["w_still"] * s_still
-    if mlvl is not None and mlvl > 0.12:      # real thrashing overrides everything
-        score = min(score, 0.25)
 
-    c.sleep_hist.append((now, score, delta_dom))
+    # Real thrashing = awake, whatever the electrodes say. This is the only thing
+    # that pulls someone OUT of sleep — a railed sensor must not.
+    if mlvl is not None and mlvl > 0.12:
+        c.sleep_hist.clear(); c.sleep_name = "awake"
+        c.asleep_since = 0.0; c._sleep_cand = 0.0
+        return done(state="awake", score=round(100 * score), conf=60,
+                    factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
+                             "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
+
+    # Trust this sample only if the forehead is actually contacting: a railed/noisy
+    # electrode (hundreds of µV) or an artefact-dominated spectrum says nothing about
+    # sleep, so it is DROPPED from the estimate rather than averaged in (its garbage
+    # low-slow-wave/high-EMG would masquerade as "awake" on a sound-asleep person).
+    front_std = (q["AF7"]["std"] + q["AF8"]["std"]) / 2.0
+    reliable = front_std < 150.0 and emg_frac < 0.35
+    if reliable:
+        c.sleep_hist.append((now, score, delta_dom))
+
     recent = [(s, dd) for (t, s, dd) in c.sleep_hist if now - t <= SLEEP_SMOOTH_SEC]
-    sm = float(np.mean([s for s, _ in recent])) if recent else score
-    dd_sm = float(np.mean([dd for _, dd in recent])) if recent else delta_dom
+    if not recent:
+        # No trustworthy EEG in the window (the forehead is railing). Thrashing was
+        # already handled above, so fall back to actigraphy — the same thing a wrist
+        # tracker does: someone lying motionless in bed is almost certainly asleep.
+        # Labelled low-confidence and motion-based so it's clear the EEG isn't backing
+        # it, and it can never pull OUT of sleep (only real movement does that).
+        held = "asleep" if s_still >= 1.0 else ("drowsy" if s_still >= 0.4 else "awake")
+        if held == "asleep" and c.asleep_since == 0.0:
+            if c._sleep_cand == 0.0:
+                c._sleep_cand = now
+            if now - c._sleep_cand >= SLEEP_ONSET_SEC:
+                c.asleep_since = c._sleep_cand
+        if held != "awake":
+            c.sleep_name = held
+        asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
+        return done(state=held, score=None, conf=25, asleep_min=asleep_min,
+                    reason="no EEG (forehead contact) — estimated from stillness",
+                    factors={"slow_ratio": None, "emg": None,
+                             "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
+    sm = float(np.mean([s for s, _ in recent]))
+    dd_sm = float(np.mean([dd for _, dd in recent]))
 
     # Hysteresis: harder to fall asleep than to stay asleep.
     if c.sleep_name == "asleep":
