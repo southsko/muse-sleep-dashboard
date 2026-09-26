@@ -98,6 +98,15 @@ OPTICS_BURST_SEC = int(os.environ.get("OPTICS_BURST_SEC", "300"))  # 5 min
 OPTICS_EVERY_MIN = int(os.environ.get("OPTICS_EVERY_MIN", "0"))    # 0 = only on demand
 OPTICS_REQ = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / ".optics_now"
 HR_LOG = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / "hr.jsonl"
+# Scheduled scans, set from the status page (it owns the file; we only read it):
+#   {"enabled": bool,
+#    "hourly": {"on": bool, "minutes": int, "mode": "quick"|"deep"},
+#    "times":  [{"at": "HH:MM", "minutes": int, "mode": "quick"|"deep"}, ...]}
+# Hourly scans run at the top of each hour; timed ones at their clock time. Either
+# still fires if the link was down at that moment and comes back within the
+# catch-up window, so a brief drop doesn't silently skip a scan.
+OPTICS_SCHEDULE = Path(os.environ.get("OUTDIR", str(HOME / "recordings"))) / ".optics_schedule.json"
+SCHEDULE_CATCHUP_MIN = 10
 
 
 def _burst_request() -> dict | None:
@@ -116,6 +125,53 @@ def _burst_request() -> dict | None:
     if mode.startswith("p") and mode[1:].isdigit():
         return {"preset": mode, "duration": OPTICS_BURST_SEC, "mode": mode}
     return {"preset": OPTICS_PRESET, "duration": OPTICS_BURST_SEC, "mode": "quick"}
+
+def _load_schedule() -> dict:
+    try:
+        sched = json.loads(OPTICS_SCHEDULE.read_text(encoding="utf-8"))
+        return sched if isinstance(sched, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _burst_spec(mode: str, minutes) -> dict:
+    mode = "deep" if mode == "deep" else "quick"
+    try:
+        sec = max(60, min(int(minutes) * 60, 30 * 60))
+    except (TypeError, ValueError):
+        sec = OPTICS_BURST_SEC
+    return {"preset": DEEP_PRESET if mode == "deep" else OPTICS_PRESET,
+            "duration": sec, "mode": mode}
+
+
+def _scheduled_burst(fired: set) -> dict | None:
+    """The scheduled scan due now, or None. `fired` remembers which slots already
+    ran (key = date + slot) so each fires once. A timed slot wins over the hourly
+    one when both fall due together — it was set on purpose."""
+    sched = _load_schedule()
+    if not sched.get("enabled"):
+        return None
+    now = datetime.now()
+    due = None
+    for t in sched.get("times") or []:
+        try:
+            hh, mm = (int(x) for x in str(t.get("at", "")).split(":"))
+            at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except (ValueError, AttributeError):
+            continue
+        key = f"t{at:%Y%m%d%H%M}"
+        late = (now - at).total_seconds()
+        if 0 <= late < SCHEDULE_CATCHUP_MIN * 60 and key not in fired:
+            fired.add(key)
+            due = due or _burst_spec(t.get("mode"), t.get("minutes"))
+    hourly = sched.get("hourly") or {}
+    if hourly.get("on"):
+        key = f"h{now:%Y%m%d%H}"
+        if now.minute < SCHEDULE_CATCHUP_MIN and key not in fired:
+            fired.add(key)
+            due = due or _burst_spec(hourly.get("mode"), hourly.get("minutes"))
+    return due
+
 
 # The OpenMuse console script lives in the venv's bin/ next to this python. The
 # systemd unit runs `<venv>/bin/python muse_athena_record.py` directly (not an
@@ -340,11 +396,15 @@ async def capture_session(mac: str, sink: RawSink, state: dict) -> float:
                 # Optics burst: on demand (status page) or on the schedule.
                 if burst_until == 0.0:
                     req = _burst_request()
+                    # A manual tap wins and doesn't consume a scheduled slot.
+                    sched = None if req else _scheduled_burst(state["fired"])
                     due = (OPTICS_EVERY_MIN > 0
                            and now - state["last_burst"] >= OPTICS_EVERY_MIN * 60)
-                    if req or due:
-                        req = req or {"preset": OPTICS_PRESET,
-                                      "duration": OPTICS_BURST_SEC, "mode": "quick"}
+                    if req or sched or due:
+                        if sched and not req:
+                            log.info("scheduled scan due")
+                        req = req or sched or {"preset": OPTICS_PRESET,
+                                               "duration": OPTICS_BURST_SEC, "mode": "quick"}
                         OPTICS_REQ.unlink(missing_ok=True)
                         state["last_burst"] = now
                         log.info("optics burst (%s): %s for %ds (capturing vitals)",
@@ -592,7 +652,7 @@ def main_loop() -> int:
     RAWDIR.mkdir(parents=True, exist_ok=True)
     _recover_orphans()   # sweep up anything a prior run left undecoded
     sink = RawSink()
-    state = {"last_burst": 0.0, "stop_hour": False}
+    state = {"last_burst": 0.0, "stop_hour": False, "fired": set()}
     no_data_streak = 0   # consecutive connects that found no band (drives backoff)
 
     def backoff() -> int:

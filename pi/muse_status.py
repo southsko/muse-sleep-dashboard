@@ -815,6 +815,23 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
   border-radius:7px;padding:.55rem 1rem;font-size:.9rem;font-weight:600;cursor:pointer}
 .lightbtn:hover{background:var(--accent);color:#0b1016}
 .lightbtn:disabled{opacity:.5;cursor:default}
+.sched{margin-top:.9rem;border-top:1px solid var(--line);padding-top:.8rem}
+.sched h3{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  margin:0 0 .6rem;font-weight:600;display:flex;align-items:center;gap:.6rem}
+.srow{display:flex;flex-wrap:wrap;align-items:center;gap:.45rem;margin:.4rem 0;font-size:.88rem}
+.sched input[type=number]{width:3.6rem}
+.sched input,.sched select{background:var(--panel2,#1b2027);color:var(--fg);
+  border:1px solid var(--line);border-radius:6px;padding:.3rem .4rem;font:inherit;font-size:.85rem}
+.sched input[type=checkbox]{width:1.05rem;height:1.05rem;accent-color:var(--accent)}
+.sched .x{background:none;border:1px solid var(--line);color:var(--muted);border-radius:6px;
+  padding:.2rem .5rem;cursor:pointer}
+.sched .x:hover{color:var(--bad);border-color:var(--bad)}
+.sched .addt{background:none;border:1px dashed var(--line);color:var(--muted);border-radius:6px;
+  padding:.3rem .6rem;cursor:pointer;font-size:.82rem}
+.sched .addt:hover{color:var(--fg);border-color:var(--accent)}
+.sched.off .sbody{opacity:.45}
+.cost{font-size:.8rem;color:var(--muted);margin-top:.4rem}
+.cost b{color:var(--fg)} .cost.hi b{color:var(--warn)}
 .sleepbadge{font-weight:600}
 .sleeppanel .sleeprow{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
 .sleepbig{font-size:1.7rem;font-weight:700;letter-spacing:.01em;min-width:9rem}
@@ -907,9 +924,24 @@ canvas{width:100%;height:100%;display:block;background:#12151a;border-radius:6px
       <button id="deepbtn" class="lightbtn" type="button">🔴 Deep scan · adds O₂ index · more battery</button>
       <span id="opticsmsg" class="stat"></span>
     </div>
+    <div class="sched off" id="sched">
+      <h3><label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+        <input type="checkbox" id="s_on"> Scheduled scans</label>
+        <span id="s_msg" class="stat" style="text-transform:none;letter-spacing:0"></span></h3>
+      <div class="sbody">
+        <div class="srow"><input type="checkbox" id="s_hr">
+          <label for="s_hr">Every hour, on the hour:</label>
+          <input type="number" id="s_hrmin" min="1" max="30" value="3"> min
+          <select id="s_hrmode"><option value="quick">🔦 quick</option><option value="deep">🔴 deep</option></select></div>
+        <div id="s_times"></div>
+        <button class="addt" type="button" id="s_add">+ add a nightly time</button>
+        <div class="cost" id="s_cost"></div>
+      </div>
+    </div>
     <div class="note" style="margin-top:.35rem">EEG-only keeps the LEDs off to save
-      battery, so vitals read “—”. Tap to run a 5-minute optics burst on the next
-      segment — the LEDs come on, heart rate is captured to the night, then it drops
+      battery, so vitals read “—”. Tap for a 5-minute optics burst now, or schedule
+      them above — the LEDs come on within seconds on the same Bluetooth link (no
+      gap in the EEG), heart rate is captured to the night, then it drops
       straight back to EEG-only. Heart rate, HRV and respiration come from the pulse;
       the <b>O₂ index needs the red LED</b> (a bright 16-channel burst) and is a
       relative trend, never a medical SpO₂ percentage.</div>
@@ -1047,6 +1079,67 @@ function requestBurst(mode){
 obtn.onclick=()=>requestBurst('quick');
 dbtn.onclick=()=>requestBurst('deep');
 
+// Scheduled scans: saved on the Pi, read live by the recorder (no restart).
+const S={on:document.getElementById('s_on'),hr:document.getElementById('s_hr'),
+  hrmin:document.getElementById('s_hrmin'),hrmode:document.getElementById('s_hrmode'),
+  times:document.getElementById('s_times'),msg:document.getElementById('s_msg'),
+  box:document.getElementById('sched'),cost:document.getElementById('s_cost')};
+function timeRow(t){
+  const r=document.createElement('div');r.className='srow trow';
+  r.innerHTML='Nightly at <input type="time" class="t_at"> for '+
+    '<input type="number" class="t_min" min="1" max="30"> min '+
+    '<select class="t_mode"><option value="quick">🔦 quick</option><option value="deep">🔴 deep</option></select> '+
+    '<button type="button" class="x" title="remove">✕</button>';
+  r.querySelector('.t_at').value=t.at||'02:00';
+  r.querySelector('.t_min').value=t.minutes||5;
+  r.querySelector('.t_mode').value=t.mode||'quick';
+  r.querySelector('.x').onclick=()=>{r.remove();saveSched();};
+  r.querySelectorAll('input,select').forEach(el=>el.onchange=saveSched);
+  S.times.appendChild(r);
+}
+function readSched(){
+  return {enabled:S.on.checked,
+    hourly:{on:S.hr.checked,minutes:+S.hrmin.value||3,mode:S.hrmode.value},
+    times:[...S.times.querySelectorAll('.trow')].map(r=>({
+      at:r.querySelector('.t_at').value,minutes:+r.querySelector('.t_min').value||5,
+      mode:r.querySelector('.t_mode').value})).filter(t=>t.at)};
+}
+function showCost(sc){
+  // Deep (bright, red LED) is the measured ~0.7 %/min; quick (dim) is far lighter.
+  const RATE={deep:0.7,quick:0.15}, NIGHT_H=8;
+  let pct=0,mins=0;
+  if(sc.hourly.on){pct+=NIGHT_H*sc.hourly.minutes*RATE[sc.hourly.mode];mins+=NIGHT_H*sc.hourly.minutes;}
+  sc.times.forEach(t=>{pct+=t.minutes*RATE[t.mode];mins+=t.minutes;});
+  S.box.classList.toggle('off',!sc.enabled);
+  if(!sc.enabled||!mins){S.cost.textContent=sc.enabled?'Nothing scheduled.':'';S.cost.className='cost';return;}
+  S.cost.className='cost'+(pct>15?' hi':'');
+  S.cost.innerHTML='About <b>'+mins+' min</b> of scans over an 8-hour night — roughly <b>'+
+    Math.round(pct)+'% extra battery</b>'+(pct>15?' (the band only just lasts a night now)':'')+'.';
+}
+let saveT=null;
+function saveSched(){
+  const sc=readSched(); showCost(sc);
+  clearTimeout(saveT);
+  saveT=setTimeout(()=>{
+    fetch('/optics/schedule',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(sc)}).then(r=>r.json()).then(d=>{
+        S.msg.textContent=d.ok?'✓ saved':'save failed';
+        S.msg.style.color=d.ok?'var(--good)':'var(--bad)';
+        setTimeout(()=>{S.msg.textContent='';},2500);
+      }).catch(()=>{S.msg.textContent='save failed';S.msg.style.color='var(--bad)';});
+  },400);
+}
+fetch('/optics/schedule').then(r=>r.json()).then(sc=>{
+  S.on.checked=!!sc.enabled;
+  S.hr.checked=!!(sc.hourly&&sc.hourly.on);
+  S.hrmin.value=(sc.hourly&&sc.hourly.minutes)||3;
+  S.hrmode.value=(sc.hourly&&sc.hourly.mode)||'quick';
+  (sc.times||[]).forEach(timeRow);
+  showCost(readSched());
+});
+[S.on,S.hr,S.hrmin,S.hrmode].forEach(el=>el.onchange=saveSched);
+document.getElementById('s_add').onclick=()=>{timeRow({});saveSched();};
+
 let PAGE_V=null;
 const es=new EventSource('/stream');
 es.onmessage=e=>{
@@ -1183,6 +1276,52 @@ es.onerror=()=>{document.getElementById('conn').innerHTML=
 
 ANNOT_PATH = os.path.join(RECDIR, "annotations.jsonl")
 OPTICS_REQ_PATH = os.path.join(RECDIR, ".optics_now")   # touch => recorder does one burst
+# Scheduled scans. This page owns the file; the recorder reads it live each second.
+OPTICS_SCHED_PATH = os.path.join(RECDIR, ".optics_schedule.json")
+SCHED_DEFAULT = {"enabled": False,
+                 "hourly": {"on": False, "minutes": 3, "mode": "quick"},
+                 "times": []}
+
+
+def _clean_slot(d: dict, default_min: int) -> dict:
+    mode = "deep" if d.get("mode") == "deep" else "quick"
+    try:
+        minutes = max(1, min(int(d.get("minutes", default_min)), 30))
+    except (TypeError, ValueError):
+        minutes = default_min
+    return {"mode": mode, "minutes": minutes}
+
+
+def load_schedule() -> dict:
+    try:
+        with open(OPTICS_SCHED_PATH, encoding="utf-8") as f:
+            sc = json.load(f)
+        return sc if isinstance(sc, dict) else dict(SCHED_DEFAULT)
+    except (OSError, ValueError):
+        return dict(SCHED_DEFAULT)
+
+
+def save_schedule(raw: dict) -> dict:
+    """Validate and write atomically (the recorder may read mid-write)."""
+    hourly = raw.get("hourly") or {}
+    times = []
+    for t in (raw.get("times") or [])[:12]:
+        at = str(t.get("at", ""))
+        try:
+            hh, mm = (int(x) for x in at.split(":"))
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                continue
+        except ValueError:
+            continue
+        times.append({"at": f"{hh:02d}:{mm:02d}", **_clean_slot(t, 5)})
+    sc = {"enabled": bool(raw.get("enabled")),
+          "hourly": {"on": bool(hourly.get("on")), **_clean_slot(hourly, 3)},
+          "times": sorted(times, key=lambda t: t["at"])}
+    tmp = OPTICS_SCHED_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sc, f)
+    os.replace(tmp, OPTICS_SCHED_PATH)
+    return sc
 
 
 def _night_date_now() -> str:
@@ -1234,6 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
             entry = add_note(text)
             return self._json({"ok": bool(entry), "entry": entry},
                               200 if entry else 400)
+        if self.path.startswith("/optics/schedule"):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = json.loads(self.rfile.read(length).decode("utf-8") if length else "{}")
+                return self._json({"ok": True, "schedule": save_schedule(raw)})
+            except (ValueError, AttributeError, OSError):
+                return self._json({"ok": False}, 400)
         if self.path.startswith("/optics"):
             # Ask the recorder for one optics burst (LEDs on, live vitals). The mode
             # word picks the preset: 'quick' = dim (HR/HRV/respiration), 'deep' =
@@ -1254,6 +1400,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/stream"):
             return self._sse()
+        if self.path.startswith("/optics/schedule"):
+            return self._json(load_schedule())
         if self.path.startswith("/api/status"):
             body = json.dumps(frame()).encode()
             self.send_response(200)
