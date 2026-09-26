@@ -105,6 +105,17 @@ app.jinja_env.filters["dur"] = charts.fmt_dur
 app.jinja_env.filters["chlabel"] = charts.channel_label
 
 
+def _with_dropouts(r: dict) -> dict:
+    """`dropouts` = real Bluetooth link losses. Nights analyzed before the count
+    existed fall back to files - 1, which was right for them: the old recorder
+    reconnected at every file boundary."""
+    if r.get("n_dropouts") is None:
+        r["dropouts"] = max((r.get("n_segments") or 1) - 1, 0)
+    else:
+        r["dropouts"] = r["n_dropouts"]
+    return r
+
+
 def rows():
     """All nights, newest first. Empty list if the worker hasn't run yet."""
     if not DB_PATH.exists():
@@ -112,7 +123,7 @@ def rows():
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        return [dict(r) for r in db.all_nights(conn)]
+        return [_with_dropouts(dict(r)) for r in db.all_nights(conn)]
     finally:
         conn.close()
 
@@ -392,10 +403,10 @@ def fragmented(r):
     stored fields so no reprocessing is needed to flag old nights."""
     if not r:
         return False
-    segs = r.get("n_segments") or 1
+    drops = r.get("dropouts", max((r.get("n_segments") or 1) - 1, 0))
     gap = r.get("gap_minutes") or 0.0
     dur = r.get("duration_minutes") or 0.0
-    return segs >= 12 or (dur > 0 and gap / dur > 0.15)
+    return drops >= 11 or (dur > 0 and gap / dur > 0.15)
 
 
 @app.route("/")

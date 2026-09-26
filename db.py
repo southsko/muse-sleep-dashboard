@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS nights (
     awakenings INTEGER,
 
     n_segments       INTEGER,            -- files this night was assembled from
+    n_dropouts       INTEGER,            -- real link losses (gaps > 5 s between files)
     gap_minutes      REAL,               -- unscored time between segments
     segments_json    TEXT,               -- source filenames
 
@@ -88,7 +89,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if not have:
         return
     wanted = {
-        "n_segments": "INTEGER", "gap_minutes": "REAL", "segments_json": "TEXT",
+        "n_segments": "INTEGER", "n_dropouts": "INTEGER",
+        "gap_minutes": "REAL", "segments_json": "TEXT",
         "SE_worn": "REAL", "SE_recording": "REAL", "awakenings": "INTEGER",
         "wear_start_time": "TEXT", "sleep_onset_time": "TEXT",
         "final_wake_time": "TEXT", "notes": "TEXT", "tags": "TEXT",
@@ -173,6 +175,7 @@ def upsert_night(conn: sqlite3.Connection, result: dict, asset_dir: str) -> None
         "sfreq_measured": result.get("sfreq_measured"),
         "staging_channel": result.get("staging_channel"),
         "n_segments": result.get("n_segments") or 1,
+        "n_dropouts": result.get("n_dropouts"),
         "gap_minutes": result.get("gap_minutes") or 0.0,
         "segments_json": json.dumps(result.get("segments") or []),
         "channels_json": json.dumps(result.get("channels") or []),

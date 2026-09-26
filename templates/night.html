@@ -69,11 +69,11 @@
   <h2>How this night was processed</h2>
   <ol class="steps">
     {% if n.n_segments and n.n_segments > 1 %}
-    <li><strong>Assembled from {{ n.n_segments }} recording segments.</strong>
-      The night is recorded in pieces — the Bluetooth link rolls a fresh segment
-      each hour and after any dropout — and they were stitched back into one
-      continuous night{% if n.gap_minutes and n.gap_minutes > 0.5 %}. The
-      {{ '%.0f'|format(n.gap_minutes) }} min of gaps between segments are left
+    <li><strong>{% if n.dropouts %}{{ n.dropouts }} Bluetooth dropout{{ '' if n.dropouts == 1 else 's' }}.{% else %}No Bluetooth dropouts.{% endif %}</strong>
+      The recorder saves a new file every hour without breaking the link, plus
+      one after any real dropout; the {{ n.n_segments }} files were stitched back
+      into one continuous night{% if n.gap_minutes and n.gap_minutes > 0.5 %}. The
+      {{ '%.0f'|format(n.gap_minutes) }} min lost to dropouts is left
       <em>unscored</em> rather than guessed at{% endif %}.</li>
     {% endif %}
     {% if n.wear_minutes and n.duration_minutes and n.wear_minutes < n.duration_minutes - 1 %}
@@ -171,9 +171,9 @@
       <dt>Headband worn</dt><dd>{{ n.wear_minutes|dur }}{% if n.wear_start_min %}
         <span style="color:var(--muted)">(from +{{ '%.0f'|format(n.wear_start_min) }} min)</span>{% endif %}</dd>
       {% if n.n_segments and n.n_segments > 1 %}
-      <dt>Segments</dt><dd>{{ n.n_segments }} files
+      <dt>Dropouts</dt><dd>{{ n.dropouts }}
         <span style="color:var(--muted)">({{ '%.0f'|format(n.gap_minutes or 0) }} min
-        unscored between them)</span></dd>
+        unscored · {{ n.n_segments }} files)</span></dd>
       {% endif %}
       <dt>Staged on</dt><dd><span class="mono">{{ n.staging_channel or '—' }}</span>{% if n.staging_channel %} <span style="color:var(--muted)">({{ n.staging_channel|chlabel }})</span>{% endif %}</dd>
       <dt>Sample rate</dt><dd>{{ '%.1f Hz'|format(n.sfreq_measured) if n.sfreq_measured else '—' }}</dd>

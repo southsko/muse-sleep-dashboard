@@ -51,7 +51,8 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 10  # v10: N3 probability weighting (N3_WEIGHT)
+SCHEMA_VERSION = 11  # v11: keep file tails (no 30 s hole per hour); count real dropouts
+#                     (v10: N3 probability weighting, N3_WEIGHT)
 #                     (v9: absorb dropout-flanking WAKE so a flaky link stops
 #                          reading as false awakenings; v8: DC-agnostic rail check)
 
@@ -149,6 +150,10 @@ class Result:
     segments: list[str] = field(default_factory=list)
     edfs: list[str] = field(default_factory=list)
     n_segments: int = 1
+    # Real link losses: gaps > DROPOUT_MIN_SEC between consecutive files. Not
+    # n_segments - 1 any more — the recorder rotates to a new file every hour on
+    # a live link, and those boundaries are seamless.
+    n_dropouts: int = 0
     gap_minutes: float = 0.0
     # Lifestyle notes the user logged during the night (coffee, weed, exercise…),
     # each {ts_local, text}, matched to this night and marked on the hypnogram.
@@ -678,6 +683,8 @@ class Segment:
     channels: list[dict] = field(default_factory=list)
     staging_channel: str | None = None
     start_utc: datetime | None = None        # start of the WORN window, UTC
+    file_start_utc: datetime | None = None   # the whole file's span, worn or not —
+    file_end_utc: datetime | None = None     # what dropout counting needs
     wear_minutes: float | None = None
     wear_start_min: float | None = None
     tz: timezone | None = None               # local offset inferred from filename
@@ -733,6 +740,9 @@ def prepare_segment(csv_path: Path, out_dir: Path) -> Segment:
     seg.duration_minutes = round(len(eeg_uv) / SFREQ / 60.0, 2)
     seg.sfreq_measured = round(measured, 2) if measured else None
     seg.tz = detect_local_tz(csv_path.stem, start_dt)
+    if start_dt is not None:
+        seg.file_start_utc = start_dt
+        seg.file_end_utc = start_dt + timedelta(seconds=len(eeg_uv) / SFREQ)
 
     if measured and abs(measured - SFREQ) / SFREQ > 0.02:
         log.warning("  %s: measured %.1f Hz vs assumed %.0f Hz "
@@ -762,6 +772,12 @@ def prepare_segment(csv_path: Path, out_dir: Path) -> Segment:
     w0, w1 = wear
     wear_start_s = w0 * EPOCH_SEC
     wear_end_s = min(w1 * EPOCH_SEC, float(raw.times[-1]))
+    # Worn right to the end of the file: keep the tail too. Wear is judged in
+    # whole 30 s epochs, so the file's final partial epoch was always cut — a
+    # 30 s hole at every hourly file boundary, which the dropout guard band then
+    # widened to ~2.5 min, on a recorder that now rotates files seamlessly.
+    if w1 >= len(eeg_uv) // int(SFREQ * EPOCH_SEC):
+        wear_end_s = len(eeg_uv) / SFREQ
     seg.wear_start_min = round(wear_start_s / 60.0, 2)
     seg.wear_minutes = round((wear_end_s - wear_start_s) / 60.0, 2)
 
@@ -842,6 +858,20 @@ def _weight_n3(proba: pd.DataFrame) -> pd.DataFrame:
     proba = proba.copy()
     proba["N3"] *= N3_WEIGHT
     return proba.div(proba.sum(axis=1), axis=0)
+
+
+# Hourly rotation seams measure ~0 s (within a sample); a real reconnect costs
+# seconds. The 2026-09-26 03:28 drop was 4.7 s — a 5 s cut-off missed it.
+DROPOUT_MIN_SEC = 1.0
+
+
+def count_dropouts(segs) -> int:
+    """Gaps longer than DROPOUT_MIN_SEC between one file's last sample and the
+    next file's first — i.e. times the Bluetooth link was actually lost."""
+    have = sorted((s for s in segs if s.file_start_utc is not None),
+                  key=lambda s: s.file_start_utc)
+    return sum((b.file_start_utc - a.file_end_utc).total_seconds() > DROPOUT_MIN_SEC
+               for a, b in zip(have, have[1:]))
 
 
 def stage_bipolar(segs, channels, n_epochs: int, t0: datetime):
@@ -1080,6 +1110,7 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
 
     raw, is_gap, t0, gap_min = assemble_night(scored)
     res.gap_minutes = gap_min
+    res.n_dropouts = count_dropouts(segs)
     res.start_time = t0.isoformat()
 
     if raw.times[-1] / 60.0 < MIN_STAGING_MINUTES:
@@ -1259,7 +1290,7 @@ def _write_stats(res: Result, json_path: Path, txt_path: Path) -> None:
         f"Status    : {res.status}" + (f" ({res.reason})" if res.reason else ""),
         f"Staged on : {res.staging_channel or 'n/a'}",
         f"Asleep    : {res.sleep_onset_time or 'n/a'} -> {res.final_wake_time or 'n/a'}",
-        f"Gaps      : {res.gap_minutes:.1f} min unscored between segments",
+        f"Dropouts  : {res.n_dropouts} ({res.gap_minutes:.1f} min unscored)",
         "",
         "Channel quality:",
     ]

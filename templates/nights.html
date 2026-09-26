@@ -31,7 +31,7 @@
       <th>{{ sortlink('awakenings', 'Wakes') }}</th>
       <th>Composition</th>
       <th>Worn</th>
-      <th>Seg</th>
+      <th>Drops</th>
       <th>Ch</th>
     </tr>
     {% for n in nights %}
@@ -47,7 +47,7 @@
       <td>{{ n.awakenings if n.awakenings is not none else '—' }}</td>
       <td style="width:130px">{{ stage_bar(n)|safe }}</td>
       <td>{{ n.wear_minutes|dur }}</td>
-      <td>{{ n.n_segments if n.n_segments and n.n_segments > 1 else "—" }}</td>
+      <td>{{ n.dropouts if n.dropouts else "—" }}</td>
       <td class="mono" style="font-size:.78rem">{{ n.staging_channel or '—' }}</td>
     </tr>
     {% endfor %}

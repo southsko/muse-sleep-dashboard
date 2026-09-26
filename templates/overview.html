@@ -52,7 +52,7 @@
   </div>
 
   {% if fragmented %}
-  <p class="fragnote">⚠ This night was broken into {{ latest.n_segments }} pieces by Bluetooth
+  <p class="fragnote">⚠ This night was broken up by {{ latest.dropouts }} Bluetooth
     dropouts ({{ latest.gap_minutes|round|int }} min of gaps). Every reconnection can read as
     a false awakening, so <b>WASO, awakenings and efficiency are unreliable here</b> — treat
     the hypnogram shape, not the exact numbers, as the real signal.</p>

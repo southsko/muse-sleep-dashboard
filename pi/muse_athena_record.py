@@ -446,56 +446,84 @@ async def capture_session(mac: str, sink: RawSink, state: dict) -> float:
 # ---------------------------------------------------------------------------
 # Decode a raw .txt to the clean CSV the analyzer expects.
 # ---------------------------------------------------------------------------
-def _decode_eeg_chunked(messages: list, chunk: int = 200):
-    """Decode raw notification lines to one concatenated EEG DataFrame, decoding
-    in small chunks and SKIPPING any chunk OpenMuse cannot decode.
+def _decode_eeg_timed(messages: list):
+    """Decode raw lines to EEG samples, each at its REAL time.
 
-    Why chunk: OpenMuse's decode_rawdata aborts the ENTIRE file on a single odd
-    packet. The Athena occasionally emits a stray 8-channel EEG packet mid-stream;
-    OpenMuse sizes its array for 4 channels and dies with a shape-broadcast error
-    (decode.py make_timestamps), taking the whole hour with it. That is exactly
-    how the first real overnight decoded to nothing. Chunking limits the loss to
-    the ~100-200 samples in the offending chunk (measured: 3 bad chunks in ~60 min
-    = <2 min lost) instead of the entire night.
+    Every BLE packet carries the band's own 256 kHz clock tick, and OpenMuse's
+    make_timestamps places samples by those ticks, so a lost packet leaves a jump
+    in time rather than silently closing up. We parse every line, unwrap the
+    32-bit tick (it rolls over every ~4.7 h) and rebase it to the file's first
+    packet, then time the WHOLE file in one make_timestamps pass — batching it
+    misplaces samples at every batch edge, because many packets share one tick
+    and OpenMuse spaces them out with a counter that a new batch resets. Device
+    time is anchored once to the wall clock of the first packet.
 
-    Returns (eeg_dataframe_or_None, n_chunks_skipped).
+    Why this matters: the old decode stamped samples as an unbroken 256 Hz run
+    from the file start. BLE drops ~2% of packets, so an hour of real time held
+    only ~58.6 min of samples; every later sample was shifted earlier and the
+    shortfall piled up as a fake 80-180 s "gap" at the end of every file — on a
+    link that never dropped.
+
+    Only 4-channel EEG subpackets are kept: the Athena occasionally emits a stray
+    8-channel one, and mixing shapes is what made OpenMuse's decode abort (the old
+    code lost a whole 200-line batch each time). Unparsable lines are skipped.
+
+    Returns (times_epoch_s, data[n,4] in µV, stats).
     """
-    import OpenMuse
-    import pandas as pd
-    frames, skipped = [], 0
-    for i in range(0, len(messages), chunk):
+    from OpenMuse.decode import make_timestamps, parse_message
+    TICK_HZ, MOD = 256000.0, 1 << 32
+    MARGIN = int(60 * TICK_HZ)
+    stats = {"bad_lines": 0, "odd_subpackets": 0}
+    subs, anchor = [], None
+    prev = wrap = 0
+    first = None
+    for m in messages:
         try:
-            d = OpenMuse.decode_rawdata(messages[i:i + chunk])
+            parsed = parse_message(m)
         except Exception:
-            skipped += 1
+            stats["bad_lines"] += 1
             continue
-        key = next((k for k in d if str(k).upper().startswith("EEG")), None)
-        if key is not None and len(d[key]):
-            frames.append(d[key])
-    if not frames:
-        return None, skipped
-    return pd.concat(frames, ignore_index=True), skipped
+        for sp in parsed.get("EEG", []):
+            d = sp.get("data")
+            if d is None or getattr(d, "ndim", 0) != 2 or d.shape[1] != 4:
+                stats["odd_subpackets"] += 1
+                continue
+            raw = sp["pkt_time_raw"]
+            if first is None:
+                first, prev = raw, raw
+                anchor = sp["message_time"].timestamp()
+            elif raw < prev - MOD // 2:            # clock rolled over
+                wrap += MOD
+                prev = raw
+            elif raw > prev + MOD // 2:            # a straggler from before the rollover
+                raw -= MOD
+            else:
+                prev = raw
+            # MARGIN keeps a packet that arrives slightly ahead of `first` (tick
+            # inversions are normal) non-negative instead of dropping it.
+            rebased = raw + wrap - first + MARGIN
+            if not 0 <= rebased < MOD:             # can't happen within a ~1 h file
+                stats["odd_subpackets"] += 1
+                continue
+            sp["pkt_time_raw"] = rebased           # keeps make_timestamps wrap-free
+            subs.append(sp)
+    if not subs:
+        return None, None, stats
+    arr = make_timestamps(subs)[0]
+    if arr.size == 0:
+        return None, None, stats
+    # make_timestamps is relative to the earliest tick; `first` sits at MARGIN, so
+    # shift by where the earliest tick lies relative to it (0 unless out of order).
+    t_first = (min(sp["pkt_time_raw"] for sp in subs) - MARGIN) / TICK_HZ
+    return anchor + t_first + arr[:, 0], arr[:, 1:5], stats
 
 
-def _first_line_epoch(raw_path: Path) -> float | None:
-    """UTC epoch of the first packet in a raw file (each line starts with an ISO
-    timestamp). That is when data really began — after the connect handshake."""
-    try:
-        with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                if ln.strip():
-                    return datetime.fromisoformat(ln.split("\t", 1)[0]).timestamp()
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def decode_txt_to_csv(raw_path: Path, csv_path: Path,
-                      start_epoch: float | None = None) -> int:
-    """Decode a raw .txt and write timestamps,TP9,AF7,AF8,TP10 (µV, epoch s).
-
-    Robust to a truncated raw file (battery death mid-segment) AND to the stray
-    undecodable packets OpenMuse chokes on — see _decode_eeg_chunked.
+def decode_txt_to_csv(raw_path: Path, csv_path: Path) -> int:
+    """Decode a raw .txt and write timestamps,TP9,AF7,AF8,TP10 (µV, epoch s) on a
+    uniform 256 Hz grid that spans the file's REAL duration. Samples sit at their
+    true times; a lost packet is a short run of empty (NaN) rows in place, which
+    the analyzer interpolates, instead of shifting the rest of the hour earlier.
+    Returns the number of grid rows.
     """
     import numpy as np
     import pandas as pd
@@ -505,40 +533,27 @@ def decode_txt_to_csv(raw_path: Path, csv_path: Path,
     if not messages:
         return 0
 
-    if start_epoch is None:
-        start_epoch = _first_line_epoch(raw_path)
-    if start_epoch is None:
-        raise RuntimeError("raw file has no parsable first timestamp")
+    t, x, st = _decode_eeg_timed(messages)
+    if t is None:
+        raise RuntimeError("no EEG decoded from the raw file")
 
-    eeg, skipped = _decode_eeg_chunked(messages)
-    if eeg is None:
-        raise RuntimeError("no EEG decoded from any chunk of the raw file")
-    if skipped:
-        log.warning("%s: skipped %d undecodable chunk(s) — a few lost samples, "
-                    "not the night", raw_path.name, skipped)
+    t0 = float(t.min())
+    idx = np.rint((t - t0) * FS).astype(np.int64)
+    n = int(idx.max()) + 1
+    grid = np.full((n, len(EEG_COLS)), np.nan, dtype=np.float32)
+    grid[idx] = x                          # decode order == column order TP9,AF7,AF8,TP10
+    filled = int(np.unique(idx).size)
+    lost = n - filled
+    if lost or any(st.values()):
+        log.info("%s: %.1f%% of samples present (%.0f s lost to BLE drops in "
+                 "small holes, left in place); %s", raw_path.name,
+                 100.0 * filled / n, lost / FS,
+                 ", ".join(f"{k}={v}" for k, v in st.items() if v) or "clean")
 
-    # Athena decodes the EEG columns PREFIXED: EEG_TP9, EEG_AF7, EEG_AF8, EEG_TP10.
-    # Normalise by stripping a leading "eeg_" so prefixed and bare names both match.
-    def _norm(c: str) -> str:
-        return str(c).lower().replace(" ", "").removeprefix("eeg_")
-    lut = {_norm(c): c for c in eeg.columns}
-    missing = [w for w in EEG_COLS if w.lower() not in lut]
-    if missing:
-        raise RuntimeError(f"missing EEG channels {missing}; got {list(eeg.columns)}")
-
-    # Units are microvolts, with a ~700 µV DC offset the server mean-centres away.
-    out = pd.DataFrame(
-        {w: pd.to_numeric(eeg[lut[w.lower()]], errors="coerce") for w in EEG_COLS}
-    )
-    n = len(out)
-
-    # Synthesize timestamps as a continuous 256 Hz UTC-epoch timeline from the
-    # record-start clock. The per-chunk decode resets each chunk's 'time' column,
-    # so it can't be stitched — but a nominal timeline is correct to within the
-    # handful of samples any skipped chunk drops, which staging does not care about.
-    out.insert(0, "timestamps", start_epoch + np.arange(n) / FS)
+    out = pd.DataFrame(grid, columns=EEG_COLS)
+    out.insert(0, "timestamps", t0 + np.arange(n) / FS)
     tmp = csv_path.with_suffix(".csv.part")
-    out.to_csv(tmp, index=False)
+    out.to_csv(tmp, index=False, float_format="%.4f")
     os.replace(tmp, csv_path)
     return n
 
@@ -627,9 +642,7 @@ def _recover_orphans() -> None:
         if not m:
             continue
         try:
-            start_epoch = _first_line_epoch(raw) or datetime.strptime(
-                m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp()
-            n = decode_txt_to_csv(raw, csv, start_epoch)
+            n = decode_txt_to_csv(raw, csv)
         except Exception as exc:
             log.warning("orphan %s could not be decoded, setting aside: %s",
                         raw.name, exc)
