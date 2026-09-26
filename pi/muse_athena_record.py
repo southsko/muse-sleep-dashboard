@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Muse S Athena overnight capture + decode, via OpenMuse.
 
-OpenMuse `record` writes *raw BLE packets* to a .txt file, not a ready CSV — the
-samples only exist after a Python decode step (`OpenMuse.decode_rawdata`), so
-capture and decode live together here.
+ONE Bluetooth connection is held for the whole night. The band streams raw BLE
+packets, written as OpenMuse-format lines (ISO-UTC timestamp, UUID, hex) to a raw
+.txt. Every SEGMENT_SEC the output is ROTATED to a fresh file on the same live
+connection — nothing disconnects — and the finished file is decoded to a clean CSV
+in ~/recordings/ by a separate background process while capture carries on:
+    timestamps, TP9, AF7, AF8, TP10   (µV, epoch seconds)
 
-Flow per segment:
-    OpenMuse record --address <MAC> --preset <p> --duration <s> --outfile raw.txt
-    -> watchdog the .txt for growth (file growing = the link is alive)
-    -> decode raw.txt to a clean CSV in ~/recordings/ that the server-side
-       analyzer accepts:  timestamps, TP9, AF7, AF8, TP10  (µV, epoch seconds)
+Why not `OpenMuse record --duration 3600` in a loop (the old design): that
+disconnects at the end of every segment, then decodes, then re-scans and
+reconnects — 140-180 s of missing EEG at EVERY hourly boundary even on a perfect
+link, i.e. a hole in the night every hour. Measured on 2026-09-24: ~16 of the
+night's 23 missing minutes were those self-inflicted handovers.
+
+Optics bursts switch preset ON THE SAME connection (halt, preset, start), and a
+real link loss is noticed at once (bleak's disconnect callback, plus a short
+no-data watchdog for a link that dies silently) and reconnected immediately.
+Each (re)connection starts a new file: a file is always one gap-free stream,
+because its CSV timestamps are laid out as a continuous 256 Hz timeline.
 
 Timezone auto-detection on the server depends on two things this script must get
 right:
@@ -22,6 +31,7 @@ timezone, so do not "fix" either to match the other.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -29,7 +39,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("athena")
@@ -54,9 +64,10 @@ MAC = os.environ.get("MUSE_MAC", "").strip()
 # EMPTY on the EEG-only presets — judge by optics ROW COUNT/values, not the key.
 PRESET = os.environ.get("MUSE_PRESET", "p21")
 
-SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # hourly segments
-STALL_SEC = int(os.environ.get("STALL_SEC", "90"))        # no growth => dead link
-POLL_SEC = int(os.environ.get("POLL_SEC", "20"))
+SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", "3600"))  # file rotation; NOT a reconnect
+# The band sends ~70 packets/s while streaming, so a few seconds of silence already
+# means the link is dead. 15 s leaves room for a preset switch (~1-2 s pause).
+STALL_SEC = int(os.environ.get("STALL_SEC", "15"))
 RETRY_SEC = int(os.environ.get("RETRY_SEC", "10"))
 # When the band is off (all day, while not worn) the link never comes up and the
 # loop would otherwise retry every RETRY_SEC forever — ~120 pointless reconnects an
@@ -173,75 +184,203 @@ def discover_mac() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Record one segment to a raw .txt, watchdogging file growth for liveness.
+# Live capture: one connection, rotating raw files.
 # ---------------------------------------------------------------------------
-def _kill(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    for _ in range(10):
-        if proc.poll() is not None:
+def _new_raw_path() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # LOCAL wall-clock (see docstring)
+    path = RAWDIR / f"overnight_{stamp}.txt"
+    while path.exists():                               # same second as the last file
+        time.sleep(1)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = RAWDIR / f"overnight_{stamp}.txt"
+    return path
+
+
+class RawSink:
+    """The file the BLE callbacks write to. rotate() swaps it for a fresh one
+    between two packets, without touching the connection, and hands the finished
+    file to a background decoder process."""
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.f = None
+        self.opened = 0.0
+        self.bytes = 0
+        self.last_data = 0.0
+        self.burst_mode: str | None = None   # optics mode this file was recorded in
+        self.decoders: list[tuple[subprocess.Popen, Path, bool]] = []
+
+    def open(self, burst_mode: str | None = None) -> None:
+        self.path = _new_raw_path()
+        self.f = open(self.path, "a", encoding="utf-8", buffering=1)
+        self.opened, self.bytes, self.burst_mode = time.time(), 0, burst_mode
+        log.info("writing %s%s", self.path.name,
+                 f" (optics burst: {burst_mode})" if burst_mode else "")
+
+    def write(self, uuid: str, data: bytearray) -> None:
+        if self.f is None:
             return
-        time.sleep(0.5)
+        line = f"{datetime.now(timezone.utc).isoformat()}\t{uuid}\t{data.hex()}\n"
+        self.f.write(line)
+        self.bytes += len(line)
+        self.last_data = time.time()
+
+    def close(self, decode: bool = True) -> None:
+        if self.f is None:
+            return
+        f, path, nbytes, burst = self.f, self.path, self.bytes, self.burst_mode
+        self.f = self.path = None
+        f.close()
+        if nbytes <= 0:
+            path.unlink(missing_ok=True)
+            return
+        log.info("closed %s (~%.0f min, %d raw bytes)", path.name,
+                 (time.time() - self.opened) / 60.0, nbytes)
+        if decode:
+            self._spawn_decoder(path, bool(burst))
+
+    def rotate(self, burst_mode: str | None = None) -> None:
+        # Open the new file BEFORE closing the old one so no callback ever finds
+        # the sink empty (callbacks run on the same event loop, but be safe).
+        old_f, old_path, old_bytes, old_burst, old_opened = (
+            self.f, self.path, self.bytes, self.burst_mode, self.opened)
+        self.open(burst_mode)
+        if old_f is not None:
+            old_f.close()
+            if old_bytes > 0:
+                log.info("rotated %s (~%.0f min, %d raw bytes) — link stays up",
+                         old_path.name, (time.time() - old_opened) / 60.0, old_bytes)
+                self._spawn_decoder(old_path, bool(old_burst))
+            else:
+                old_path.unlink(missing_ok=True)
+
+    def _spawn_decoder(self, raw: Path, burst: bool) -> None:
+        # A separate, niced PROCESS: decoding an hour takes ~35 s of CPU, and doing
+        # it in this process would starve the BLE callbacks (GIL) — or, as the old
+        # design did, stop recording while it ran.
+        cmd = ["nice", "-n", "10", sys.executable, os.path.abspath(__file__),
+               "--decode-only", str(raw)]
+        if burst:
+            cmd.append("--hr")
+        try:
+            self.decoders.append((subprocess.Popen(cmd), raw, burst))
+        except OSError as exc:
+            log.warning("could not start decoder for %s (left for orphan recovery): %s",
+                        raw.name, exc)
+
+    def reap(self) -> None:
+        still = []
+        for proc, raw, burst in self.decoders:
+            if proc.poll() is None:
+                still.append((proc, raw, burst))
+            elif proc.returncode != 0:
+                log.error("decode of %s failed (raw kept for recovery)", raw.name)
+        self.decoders = still
+
+
+async def _set_preset(client, preset: str) -> None:
+    """Switch preset on a live connection: the same halt -> preset -> start
+    sequence OpenMuse uses at connect time. Streaming pauses ~1 s."""
+    from OpenMuse.muse import MuseS
+    await MuseS.send_command(client, "h"); await asyncio.sleep(0.2)
+    await MuseS.send_command(client, preset); await asyncio.sleep(0.2)
+    await MuseS.send_command(client, "dc001"); await asyncio.sleep(0.05)
+    await MuseS.send_command(client, "dc001"); await asyncio.sleep(0.1)
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
+        await MuseS.send_command(client, "L1")
+    except Exception:
         pass
 
 
-def record_segment(mac: str, raw_path: Path,
-                   preset: str = PRESET, duration_sec: int = SEGMENT_SEC,
-                   interruptible: bool = False) -> tuple[float, int]:
-    """Returns (seconds_ran, bytes_written). Kills the recorder if the file
-    stops growing — OpenMuse can sit alive after the link dies.
+async def capture_session(mac: str, sink: RawSink, state: dict) -> float:
+    """Connect once and stream until the link dies, stop is requested, or
+    STOP_HOUR passes. Rotates files and runs optics bursts without dropping the
+    connection. Returns seconds of real data captured (0 = never connected)."""
+    import bleak
+    from OpenMuse.muse import MuseS
 
-    interruptible: end this segment early if an optics burst is requested, so a
-    tap on the status page lights up within seconds instead of waiting out the
-    rest of an hour-long segment. Only normal segments are interruptible; a burst
-    itself runs to completion."""
-    # Flags confirmed on fw 3.1.15: record --address --preset --duration --outfile
-    # (no --record needed). "Device ... was not found" here just means the band
-    # isn't advertising this instant (asleep, or held by the phone app) — the loop
-    # retries and latches when it comes back.
-    cmd = [OPENMUSE, "record", "--address", mac, "--preset", preset,
-           "--duration", str(duration_sec), "--outfile", str(raw_path)]
-    log.info("recording: %s", " ".join(cmd))
-    try:
-        proc = subprocess.Popen(cmd, start_new_session=True)
-    except FileNotFoundError:
-        log.error("OpenMuse not found on PATH — is the venv active?")
-        return 0.0, 0
+    lost = asyncio.Event()
 
-    start = time.time()
-    last, stalled = -1, 0
+    def on_disconnect(_client) -> None:
+        lost.set()
+
+    def cb(uuid: str):
+        def inner(_, data: bytearray) -> None:
+            sink.write(uuid, data)
+        return inner
+
+    log.info("connecting to %s (preset %s)", mac, PRESET)
+    started = 0.0
     try:
-        while proc.poll() is None:
-            if _stop:
-                break
-            if interruptible and OPTICS_REQ.exists():
-                log.info("optics burst requested — ending this segment early to start it")
-                break
-            time.sleep(POLL_SEC)
-            size = raw_path.stat().st_size if raw_path.exists() else 0
-            if size > last:
-                last, stalled = size, 0
+        async with bleak.BleakClient(mac, timeout=15.0,
+                                     disconnected_callback=on_disconnect) as client:
+            sink.open()
+            await MuseS.connect_and_initialize(
+                client, PRESET, {u: cb(u) for u in MuseS.DATA_CHARACTERISTICS},
+                verbose=True)
+            t0 = time.time()
+            burst_until = 0.0
+            while not lost.is_set() and not _stop:
+                await asyncio.sleep(1.0)
+                now = time.time()
+                sink.reap()
+
+                if sink.bytes > 0 and not started:
+                    started = sink.opened
+                    log.info("streaming — link up")
+                if not started and now - t0 > CONNECT_GRACE_SEC:
+                    log.warning("connected but no data after %ss — reconnecting",
+                                CONNECT_GRACE_SEC)
+                    break
+                if started and now - sink.last_data > STALL_SEC:
+                    log.warning("STALL: no data for %.0fs — link presumed dead, "
+                                "reconnecting", now - sink.last_data)
+                    break
+
+                # Optics burst: on demand (status page) or on the schedule.
+                if burst_until == 0.0:
+                    req = _burst_request()
+                    due = (OPTICS_EVERY_MIN > 0
+                           and now - state["last_burst"] >= OPTICS_EVERY_MIN * 60)
+                    if req or due:
+                        req = req or {"preset": OPTICS_PRESET,
+                                      "duration": OPTICS_BURST_SEC, "mode": "quick"}
+                        OPTICS_REQ.unlink(missing_ok=True)
+                        state["last_burst"] = now
+                        log.info("optics burst (%s): %s for %ds (capturing vitals)",
+                                 req["mode"], req["preset"], req["duration"])
+                        sink.rotate(burst_mode=req["mode"])
+                        await _set_preset(client, req["preset"])
+                        burst_until = now + req["duration"]
+                        continue
+                elif now >= burst_until:
+                    log.info("optics burst done — back to %s", PRESET)
+                    await _set_preset(client, PRESET)
+                    sink.rotate()
+                    burst_until = 0.0
+                    continue
+
+                if burst_until == 0.0 and now - sink.opened >= SEGMENT_SEC:
+                    sink.rotate()
+
+                if _past_stop_hour():
+                    log.info("past STOP_HOUR=%s — stopping for the day", STOP_HOUR)
+                    state["stop_hour"] = True
+                    break
+
+            if lost.is_set():
+                log.warning("link lost (device disconnected) — reconnecting now")
             else:
-                stalled += POLL_SEC
-            elapsed = time.time() - start
-            if last <= 0 and elapsed < CONNECT_GRACE_SEC:
-                continue  # nothing written until the link comes up and first packet lands
-            if stalled >= STALL_SEC:
-                log.warning("STALL: no new data for %ss (%d bytes) — link presumed dead",
-                            stalled, max(last, 0))
-                break
+                await MuseS.stop_streaming(client)
+    except Exception as exc:
+        msg = str(exc).strip() or type(exc).__name__
+        if sink.bytes > 0:
+            log.warning("link error: %s — reconnecting now", msg)
+        else:
+            log.debug("connect failed: %s", msg)
     finally:
-        _kill(proc)
-    ran = time.time() - start
-    size = raw_path.stat().st_size if raw_path.exists() else 0
-    return ran, size
+        sink.close()
+    return (time.time() - started) if started else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +417,21 @@ def _decode_eeg_chunked(messages: list, chunk: int = 200):
     return pd.concat(frames, ignore_index=True), skipped
 
 
-def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int:
+def _first_line_epoch(raw_path: Path) -> float | None:
+    """UTC epoch of the first packet in a raw file (each line starts with an ISO
+    timestamp). That is when data really began — after the connect handshake."""
+    try:
+        with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if ln.strip():
+                    return datetime.fromisoformat(ln.split("\t", 1)[0]).timestamp()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def decode_txt_to_csv(raw_path: Path, csv_path: Path,
+                      start_epoch: float | None = None) -> int:
     """Decode a raw .txt and write timestamps,TP9,AF7,AF8,TP10 (µV, epoch s).
 
     Robust to a truncated raw file (battery death mid-segment) AND to the stray
@@ -291,6 +444,11 @@ def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int
         messages = [ln for ln in f if ln.strip()]
     if not messages:
         return 0
+
+    if start_epoch is None:
+        start_epoch = _first_line_epoch(raw_path)
+    if start_epoch is None:
+        raise RuntimeError("raw file has no parsable first timestamp")
 
     eeg, skipped = _decode_eeg_chunked(messages)
     if eeg is None:
@@ -319,7 +477,9 @@ def decode_txt_to_csv(raw_path: Path, csv_path: Path, start_epoch: float) -> int
     # so it can't be stitched — but a nominal timeline is correct to within the
     # handful of samples any skipped chunk drops, which staging does not care about.
     out.insert(0, "timestamps", start_epoch + np.arange(n) / FS)
-    out.to_csv(csv_path, index=False)
+    tmp = csv_path.with_suffix(".csv.part")
+    out.to_csv(tmp, index=False)
+    os.replace(tmp, csv_path)
     return n
 
 
@@ -407,7 +567,7 @@ def _recover_orphans() -> None:
         if not m:
             continue
         try:
-            start_epoch = datetime.strptime(
+            start_epoch = _first_line_epoch(raw) or datetime.strptime(
                 m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp()
             n = decode_txt_to_csv(raw, csv, start_epoch)
         except Exception as exc:
@@ -431,14 +591,14 @@ def main_loop() -> int:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     RAWDIR.mkdir(parents=True, exist_ok=True)
     _recover_orphans()   # sweep up anything a prior run left undecoded
-    last_burst = 0.0     # time.time() of the last optics burst (for the schedule)
-    no_data_streak = 0   # consecutive attempts that found no band (drives backoff)
+    sink = RawSink()
+    state = {"last_burst": 0.0, "stop_hour": False}
+    no_data_streak = 0   # consecutive connects that found no band (drives backoff)
 
     def backoff() -> int:
         return min(RETRY_SEC * (2 ** min(no_data_streak, 6)), RETRY_MAX_SEC)
 
     while not _stop:
-        _recover_orphans()   # and again each cycle (cheap when there's nothing to do)
         if not reset_bt():
             time.sleep(RETRY_SEC)
             continue
@@ -449,76 +609,27 @@ def main_loop() -> int:
                 time.sleep(backoff())
                 continue
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # LOCAL wall-clock (see docstring)
-        raw_path = RAWDIR / f"overnight_{stamp}.txt"
-        csv_path = OUTDIR / f"overnight_{stamp}.csv"
-        start_epoch = time.time()
-
-        # A short optics "light stab" (LEDs on, capture vitals) if the button
-        # requested one or it's due on the schedule; otherwise normal EEG-only p21.
-        req = _burst_request()
-        scheduled = (OPTICS_EVERY_MIN > 0
-                     and time.time() - last_burst >= OPTICS_EVERY_MIN * 60)
-        burst = bool(req) or scheduled
-        if burst:
-            if req:
-                preset, duration, mode = req["preset"], req["duration"], req["mode"]
-            else:
-                preset, duration, mode = OPTICS_PRESET, OPTICS_BURST_SEC, "quick"
-            OPTICS_REQ.unlink(missing_ok=True)
-            last_burst = time.time()
-            log.info("optics burst (%s): %s for %ds (capturing vitals)",
-                     mode, preset, duration)
-        else:
-            preset, duration = PRESET, SEGMENT_SEC
-
-        # Normal segments end early when a burst is requested, so a tap lights the
-        # LEDs within seconds instead of waiting out the rest of the hour.
-        ran, size = record_segment(MAC, raw_path, preset, duration,
-                                   interruptible=not burst)
-
-        if size <= 0:
-            # No packets at all: the link never came up (band off/not worn). Back
-            # off on a run of these rather than spinning empty files every RETRY_SEC.
-            no_data_streak += 1
-            wait = backoff()
-            log.warning("segment produced no data — link down (x%d); retrying in %ss",
-                        no_data_streak, wait)
-            raw_path.unlink(missing_ok=True)
-            time.sleep(wait)
-            continue
-        no_data_streak = 0   # real data arrived — back to prompt retries
-
-        try:
-            n = decode_txt_to_csv(raw_path, csv_path, start_epoch)
-            log.info("segment saved: %s (%d samples, ~%.0f min, %d raw bytes)",
-                     csv_path.name, n, ran / 60.0, size)
-        except Exception as exc:
-            # Keep the raw file when decode fails — it is the only source of
-            # record and is exactly what you need to fix the decode assumptions.
-            log.exception("decode failed for %s (raw kept): %s", raw_path.name, exc)
-            n = -1
-
-        # Pull heart rate out of an optics burst before the raw is discarded.
-        if burst and n >= 0 and raw_path.exists():
-            bpm = extract_and_log_hr(raw_path)
-            if bpm:
-                log.info("heart rate from optics burst: %d bpm", bpm)
-
-        if n >= 0 and not KEEP_RAW:
-            raw_path.unlink(missing_ok=True)
-
-        if _past_stop_hour():
-            log.info("past STOP_HOUR=%s — stopping for the day", STOP_HOUR)
+        streamed = asyncio.run(capture_session(MAC, sink, state))
+        if state["stop_hour"] or _stop:
             break
+        if streamed > 0:
+            # Real data flowed, so the band is on: reconnect IMMEDIATELY. Every
+            # second spent here is a second of the night not recorded.
+            no_data_streak = 0
+            continue
+        no_data_streak += 1
+        wait = backoff()
+        if no_data_streak == 1 or no_data_streak % 30 == 0:
+            log.warning("band not reachable (x%d) — retrying in %ss", no_data_streak, wait)
+        _recover_orphans()
+        time.sleep(wait)
 
-        # A segment far shorter than its duration means the link is flaky; the
-        # loop rebuilds the adapter/stream on the next pass. (A burst is meant to
-        # be short, so judge it against its own duration, not the hourly default.)
-        if ran < duration / 2:
-            log.info("segment ended early (%.0fs of %ss) — rebuilding", ran, duration)
-            time.sleep(RETRY_SEC)
-
+    # Let in-flight decoders finish so the last file is not left stranded.
+    for proc, _raw, _b in sink.decoders:
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
     log.info("recorder exiting cleanly")
     return 0
 
@@ -528,6 +639,8 @@ def main() -> int:
     ap.add_argument("--decode-only", metavar="RAW_TXT",
                     help="decode an existing raw .txt to a CSV beside it and exit "
                          "(for validating the decode against a test recording)")
+    ap.add_argument("--hr", action="store_true",
+                    help="with --decode-only: also extract heart rate (optics burst)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -537,12 +650,21 @@ def main() -> int:
     )
 
     if args.decode_only:
+        # Also the recorder's background decoder: raw in RAWDIR -> CSV in OUTDIR.
         raw = Path(args.decode_only)
-        csv = raw.with_suffix(".csv")
-        # No real record start for an offline file — synthesize from the file's
-        # mtime so timestamps are still plausible epoch seconds.
-        n = decode_txt_to_csv(raw, csv, start_epoch=raw.stat().st_mtime)
-        log.info("decoded %d samples -> %s", n, csv)
+        csv = (OUTDIR if raw.parent == RAWDIR else raw.parent) / f"{raw.stem}.csv"
+        try:
+            n = decode_txt_to_csv(raw, csv)
+        except Exception:
+            log.exception("decode failed for %s (raw kept)", raw.name)
+            return 1
+        log.info("segment saved: %s (%d samples, ~%.0f min)", csv.name, n, n / FS / 60)
+        if args.hr:
+            bpm = extract_and_log_hr(raw)
+            if bpm:
+                log.info("heart rate from optics burst: %d bpm", bpm)
+        if n > 0 and raw.parent == RAWDIR and not KEEP_RAW:
+            raw.unlink(missing_ok=True)
         return 0
 
     signal.signal(signal.SIGTERM, _on_term)

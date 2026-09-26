@@ -51,8 +51,17 @@ log = logging.getLogger("muse")
 
 # Bump when the pipeline changes in a way that invalidates existing results;
 # files whose stats JSON carries an older version are reprocessed automatically.
-SCHEMA_VERSION = 9   # v9: absorb dropout-flanking WAKE so a flaky link stops
-#                          reading as false awakenings (v8: DC-agnostic rail check)
+SCHEMA_VERSION = 10  # v10: N3 probability weighting (N3_WEIGHT)
+#                     (v9: absorb dropout-flanking WAKE so a flaky link stops
+#                          reading as false awakenings; v8: DC-agnostic rail check)
+
+# YASA is trained on central-to-mastoid EEG; the Muse's forehead-to-ear
+# derivation picks up weaker slow waves, so deep sleep comes out at 0.5-6% on
+# every night. Scaling the N3 probability before the argmax corrects that bias.
+# Tested on 4 nights (2026-09-16..24): weight 3 moves N3 to ~9-12% taking only
+# from N2 (REM and WAKE unchanged), and the added N3 sits in the first half of
+# the night, as real slow-wave sleep does. 1.0 = plain YASA.
+N3_WEIGHT = float(os.environ.get("N3_WEIGHT", "3.0"))
 
 SFREQ = 256.0
 EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
@@ -826,6 +835,15 @@ def assemble_night(segs: list[Segment]) -> tuple[mne.io.RawArray, np.ndarray, da
     return raw, is_gap, t0, round(float(is_gap.sum()) * EPOCH_SEC / 60.0, 2)
 
 
+def _weight_n3(proba: pd.DataFrame) -> pd.DataFrame:
+    """Apply N3_WEIGHT and renormalise so each epoch still sums to 1."""
+    if N3_WEIGHT == 1.0 or "N3" not in proba.columns:
+        return proba
+    proba = proba.copy()
+    proba["N3"] *= N3_WEIGHT
+    return proba.div(proba.sum(axis=1), axis=0)
+
+
 def stage_bipolar(segs, channels, n_epochs: int, t0: datetime):
     """Stage the night on bipolar frontal-to-ear derivations and map to timeline.
 
@@ -894,6 +912,7 @@ def stage_bipolar(segs, channels, n_epochs: int, t0: datetime):
     for p in probas[1:]:
         pc = pc.add(p, fill_value=0)
     pc = pc / len(probas)
+    pc = _weight_n3(pc)
     stages_cat = pc.idxmax(axis=1).tolist()
 
     # Place each segment's epochs back onto the real-time timeline.
@@ -1079,8 +1098,8 @@ def process_night(csv_paths: list[Path], out_dir: Path) -> Result:
     else:
         # Last-ditch fallback: single channel on the zero-filled assembly.
         staged = yasa.SleepStaging(raw, eeg_name=ch).predict()
-        stages, proba, res.staging_channel = (
-            staged.hypno.tolist(), staged.proba, ch)
+        proba = _weight_n3(staged.proba)
+        stages, res.staging_channel = proba.idxmax(axis=1).tolist(), ch
 
     log.info("  assembled %.1f min continuous (%.1f min of gaps), staged on %s",
              raw.times[-1] / 60.0, gap_min, res.staging_channel)

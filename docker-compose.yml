@@ -28,7 +28,10 @@ services:
       # Decides both the nightly run time and which calendar night a recording
       # is filed under. Set this to your own timezone (e.g. America/New_York);
       # ideally the same zone the Pi uses so recording filenames line up.
-      TZ: Etc/UTC
+      # Set it in a local .env (gitignored), e.g. TZ=America/New_York.
+      TZ: ${TZ:-Etc/UTC}
+      # Deep-sleep (N3) probability weight, see N3_WEIGHT in analyze.py. 1.0 = plain YASA.
+      N3_WEIGHT: "3.0"
       INPUT_DIR: /remotes/muse_recordings
       OUTPUT_DIR: /data/output
       # Dashboard runs alongside the scheduler in this same container.

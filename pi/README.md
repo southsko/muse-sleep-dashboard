@@ -70,14 +70,19 @@ sudo reboot
 
 ## How the recorder works
 
-OpenMuse `record` writes raw BLE packets to a `.txt`; the samples only exist after
-a Python decode step. So `muse_athena_record.py` does both — capture and decode —
-in one supervised loop:
+The band streams raw BLE packets, written in OpenMuse's raw `.txt` format; the
+samples only exist after a Python decode step. `muse_athena_record.py` does both:
 
-- **Hourly segments** (`SEGMENT_SEC=3600`), merged back into one night on the
-  server. Bounds memory and caps what any single dropout costs.
-- **Liveness watchdog:** the raw `.txt` growing is the signal the link is alive; a
-  stall tears the segment down and reconnects.
+- **One connection all night.** It connects once (via bleak + OpenMuse's
+  handshake) and never disconnects on purpose. Every `SEGMENT_SEC` (3600) it
+  **rotates** to a fresh raw file on the live link and a separate background
+  process decodes the finished one to CSV — no gap at the hour. (The old design
+  looped `OpenMuse record --duration 3600`, which dropped the link every hour and
+  lost 140-180 s of EEG at each boundary.)
+- **Optics bursts** switch preset on the same connection (halt, preset, start).
+- **Instant reconnect:** bleak's disconnect callback, plus a `STALL_SEC` (15 s)
+  no-data watchdog for a silent link death, reconnect immediately. Each
+  (re)connection starts a new file, so every file is one gap-free stream.
 - **Bluetooth recovery:** resets the adapter and *verifies* it returns to
   `UP RUNNING` (a bare reset can leave it `DOWN`, after which every connect fails).
 - **Chunked decode:** OpenMuse's decoder aborts the whole file on a single odd
