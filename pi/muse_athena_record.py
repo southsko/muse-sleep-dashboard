@@ -76,7 +76,10 @@ RETRY_SEC = int(os.environ.get("RETRY_SEC", "10"))
 # enough that putting the band on at bedtime is still noticed within a couple minutes.
 RETRY_MAX_SEC = int(os.environ.get("RETRY_MAX_SEC", "120"))
 CONNECT_GRACE_SEC = int(os.environ.get("CONNECT_GRACE_SEC", "120"))
-KEEP_RAW = os.environ.get("KEEP_RAW", "0") == "1"         # keep raw .txt after decode
+KEEP_RAW = os.environ.get("KEEP_RAW", "1") == "1"         # keep raw .txt after decode (DEFAULT ON: raw is
+                                                          # ~0.2 GB/night and the only thing that lets a
+                                                          # decode/timing bug be re-decoded later — set 0 to drop)
+MIN_FREE_GB = int(os.environ.get("MIN_FREE_GB", "15"))    # only ever prune raw (oldest first) below this free space
 STOP_HOUR = os.environ.get("STOP_HOUR", "").strip()       # optional: stop looping at HH:00 local
 
 FS = 256.0
@@ -687,11 +690,34 @@ def _recover_orphans() -> None:
             raw.rename(raw.with_suffix(".txt.failed"))
 
 
+def _prune_raw_low_space() -> None:
+    """Raw .txt is kept indefinitely (see KEEP_RAW) so any night can be re-decoded,
+    but never let it fill the card: only if free space on RAWDIR drops below
+    MIN_FREE_GB, delete the OLDEST raw first until back above it. Decoded CSVs are
+    never touched — only raw .txt / .txt.failed."""
+    try:
+        import shutil
+        need = MIN_FREE_GB * (1 << 30)
+        if shutil.disk_usage(RAWDIR).free >= need:
+            return
+        raws = list(RAWDIR.glob("*.txt")) + list(RAWDIR.glob("*.txt.failed"))
+        for raw in sorted(raws, key=lambda p: p.stat().st_mtime):   # oldest first
+            if shutil.disk_usage(RAWDIR).free >= need:
+                break
+            sz = raw.stat().st_size
+            raw.unlink(missing_ok=True)
+            log.warning("low space (<%d GB free): pruned oldest raw %s (%.0f MB)",
+                        MIN_FREE_GB, raw.name, sz / 1e6)
+    except OSError as exc:
+        log.debug("raw prune skipped: %s", exc)
+
+
 def main_loop() -> int:
     global MAC
     OUTDIR.mkdir(parents=True, exist_ok=True)
     RAWDIR.mkdir(parents=True, exist_ok=True)
     _recover_orphans()   # sweep up anything a prior run left undecoded
+    _prune_raw_low_space()
     sink = RawSink()
     state = {"last_burst": 0.0, "stop_hour": False, "fired": set()}
     no_data_streak = 0   # consecutive connects that found no band (drives backoff)
@@ -711,6 +737,7 @@ def main_loop() -> int:
                 continue
 
         streamed = asyncio.run(capture_session(MAC, sink, state))
+        _prune_raw_low_space()   # cheap no-op unless the card is genuinely low
         if state["stop_hour"] or _stop:
             break
         if streamed > 0:

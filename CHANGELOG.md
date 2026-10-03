@@ -24,6 +24,14 @@ hole before the next file (which is anchored to real arrival time).
   3515.6 s → fixed 3599.98 s (seam error 0 ms); a true-256 Hz file is left unchanged.
 - Pi backup: `~/muse_athena_record.py.pre-seamfix-20261003`.
 
+### Keep the raw capture by default
+`KEEP_RAW` now defaults to **on**. Raw `.txt` was being deleted the moment it decoded,
+which repeatedly left no way to re-decode a night when a decode/timing bug (like the
+seam gap above) turned up later. Raw is ~0.2 GB/night and the card has 187 GB free, so
+there's no reason to throw it away. A low-space safety valve (`MIN_FREE_GB`, default 15)
+only ever trims the **oldest raw first** if free space actually drops that low — decoded
+CSVs are never touched. Pi backup: `~/muse_athena_record.py.pre-keepraw-20261003`.
+
 ## 2026-10-02
 
 ### Everything now runs on the Pi (Unraid retired)
