@@ -93,6 +93,27 @@ SLEEP_ENTER = 0.60                # smoothed score to call it asleep …
 SLEEP_STAY = 0.45                 # … and to keep it (hysteresis, no flicker)
 SLEEP_DROWSY = 0.35              # below this = awake
 
+# --- Contact + awake/asleep separators (recalibrated 2026-10-02 against a real
+# ON-HEAD session: awake eyes-open, eyes-closed, then the band on the nightstand;
+# plus last night's staged sleep). The 2026-09-20 calibration was taken OFF-skin
+# (ears "railed" ~578µV = mains hum, not EEG), which is why a band on the table,
+# and a still-but-awake wearer, both read as "asleep". Overridable per wearer in
+# .sleep_calib.json. See sleep_state(). ---
+CONTACT_MAINS_UV = 120.0          # worst-channel 60/50 Hz hum above this = no skin
+#                                   contact (on-head measured ≤55µV; off-head 150-580).
+#                                   Off contact there is no brain to stage -> "no contact",
+#                                   never the stillness guess (a band on the table is NOT asleep).
+EMG_GATE = 0.45                   # max 30-50 Hz fraction to still TRUST a window as brain.
+#                                   Raised from 0.35: this wearer's awake forehead EEG is very
+#                                   low amplitude, so its gamma fraction runs to ~0.36 even on
+#                                   clean, still, on-skin signal — 0.35 rejected real awake EEG,
+#                                   fell back to stillness, and mislabelled a still wearer asleep.
+EMG_SLEEP = 0.10                  # a sleep stage requires muscle atonia (emg below this).
+#                                   Measured: asleep emg median 0.03, awake 0.14. Without this,
+#                                   awake blinks (big slow-wave transients) cross the slow-wave
+#                                   thresholds and read as "light"/"deep". Smoothed real sleep
+#                                   sits at ~0.03, so this keeps ~89% of the night reading asleep.
+
 # Per-wearer calibration. The generic thresholds were tuned on one night's YASA
 # staging; a given person's band/fit/contact shifts where their "asleep" cluster
 # sits (especially forehead-only, when their ears rail). Drop a JSON here — from a
@@ -521,6 +542,23 @@ def sleep_state(c: "Collector") -> dict:
     if q["AF7"]["verdict"] in ("flat", "no data") and q["AF8"]["verdict"] in ("flat", "no data"):
         return done(state="unknown", reason="forehead sensors have no signal")
 
+    cal = sleep_calib()
+    emg_gate = float(cal.get("emg_gate", EMG_GATE))
+    emg_sleep = float(cal.get("emg_sleep", EMG_SLEEP))
+    contact_uv = float(cal.get("contact_mains_uv", CONTACT_MAINS_UV))
+
+    # No-skin-contact guard. Off the head (or badly unseated) the electrodes float
+    # and pick up mains hum at 150-580µV where on-skin contact shorts it to ~45. There
+    # is no brain signal to stage, so say so plainly — do NOT fall through to the
+    # stillness guess below, or a band resting on the nightstand reads as "asleep".
+    mains_uv = (mains(arr) or {}).get("uv") or 0.0
+    if mains_uv > contact_uv:
+        c.sleep_hist.clear(); c.sleep_name = "unknown"
+        c.asleep_since = 0.0; c._sleep_cand = 0.0
+        return done(state="unknown", conf=0,
+                    reason="no skin contact (mains %.0fµV) — band off or unseated" % mains_uv,
+                    factors={"mains_uv": round(mains_uv), "who": cal.get("name")})
+
     seg = arr[-int(SLEEP_WIN_SEC * SFREQ):]
     idx = {ch: i for i, ch in enumerate(CHANNELS)}
     # The LIVE estimate uses the forehead sum (AF7+AF8). The morning pipeline's
@@ -542,7 +580,6 @@ def sleep_state(c: "Collector") -> dict:
     slow_ratio = (d + th) / (al + be + 1e-9)
     emg_frac = emg / tot
     delta_dom = d / tot
-    cal = sleep_calib()          # kept only for an optional wearer name in the readout
     mv = movement(c)
     mlvl = mv.get("level")
 
@@ -559,32 +596,30 @@ def sleep_state(c: "Collector") -> dict:
     # muscle: a railed electrode or an artefact-dominated spectrum (emg_frac far above
     # any real stage's ~0.12) says nothing about sleep — drop it, don't average it in.
     front_std = (q["AF7"]["std"] + q["AF8"]["std"]) / 2.0
-    reliable = front_std < 150.0 and emg_frac < 0.35
+    reliable = front_std < 150.0 and emg_frac < emg_gate
     if reliable:
         c.sleep_hist.append((now, slow_ratio, emg_frac, delta_dom))
 
     recent = [r for r in c.sleep_hist if now - r[0] <= SLEEP_SMOOTH_SEC]
     if len(recent) < SLEEP_MIN_SAMPLES:
-        # Not enough clean EEG to trust a stage — one glitchy window is not deep
-        # sleep. Fall back to actigraphy, like a wrist tracker: motionless in bed =>
-        # asleep, low-confidence and motion-based.
-        s_still = 1.0 if (mlvl is not None and mlvl < 0.03) else \
-                  (0.4 if (mlvl is not None and mlvl < 0.12) else 0.5)
-        held = "asleep" if s_still >= 1.0 else ("light" if s_still >= 0.4 else "awake")
-        if held in ("asleep", "light"):
-            if c.asleep_since == 0.0:
-                if c._sleep_cand == 0.0:
-                    c._sleep_cand = now
-                if now - c._sleep_cand >= SLEEP_ONSET_SEC:
-                    c.asleep_since = c._sleep_cand
-        else:
-            c._sleep_cand = 0.0; c.asleep_since = 0.0
-        c.sleep_name = held
-        asleep_min = round((now - c.asleep_since) / 60.0) if c.asleep_since > 0 else None
-        return done(state=held, conf=25, asleep_min=asleep_min,
-                    depth=(20 if held != "awake" else None),
-                    reason="EEG buried in muscle/noise — going by stillness",
-                    factors={"slow_ratio": None, "emg": None,
+        # Fewer than 5 trustworthy brain windows in the last 90 s. The old code guessed
+        # sleep from stillness here ("motionless => asleep", wrist-tracker style) — and
+        # that is exactly what made a band on the nightstand, and a still-but-awake
+        # wearer, read as asleep. A still + low-noise signal off the head is
+        # indistinguishable from quiet sleep by motion alone, so we do NOT guess:
+        # movement => awake, otherwise "unknown / check contact". This costs nothing on
+        # a good night (the EEG path below carries real sleep — a clean night spends ~0%
+        # here) and only shows "unknown" during genuinely bad-signal stretches (off-head,
+        # a slipped band, a dropout), which is the honest thing to show.
+        if mlvl is not None and mlvl > 0.12:
+            c.sleep_name = "awake"; c._sleep_cand = 0.0; c.asleep_since = 0.0
+            return done(state="awake", conf=55,
+                        factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
+                                 "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
+        c.sleep_name = "unknown"; c._sleep_cand = 0.0; c.asleep_since = 0.0
+        return done(state="unknown", conf=0,
+                    reason="no clear brain signal — band off, unseated, or poor contact",
+                    factors={"slow_ratio": round(slow_ratio, 1), "emg": round(emg_frac, 3),
                              "still": mv.get("label"), "deriv": deriv, "who": cal.get("name")})
 
     # Smoothed features (~90 s; stages last minutes, single 8 s windows are noisy),
@@ -595,11 +630,15 @@ def sleep_state(c: "Collector") -> dict:
     #   forehead sensor); the morning YASA pass owns the real staging.
     slow_s = float(np.median([r[1] for r in recent]))
     emg_s = float(np.median([r[2] for r in recent]))
-    if slow_s >= 12.0:
+    # A sleep stage requires BOTH slow-wave content AND muscle atonia (emg_s below
+    # emg_sleep). The atonia test is what separates real sleep (emg ~0.03) from an
+    # awake wearer whose blinks/eye-muscle pushed slow-wave up (emg ~0.14): with
+    # muscle tone present it is awake, however high the slow-wave ratio looks.
+    if slow_s >= 12.0 and emg_s < emg_sleep:
         state = "deep"
-    elif slow_s >= 4.0:
+    elif slow_s >= 4.0 and emg_s < emg_sleep:
         state = "light"
-    elif emg_s < 0.10:
+    elif emg_s < emg_sleep and slow_s < 4.0:
         state = "rem"                     # low slow-wave + atonia -> possible dreaming
     else:
         state = "awake"

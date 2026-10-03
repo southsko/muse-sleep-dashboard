@@ -1,0 +1,49 @@
+[Unit]
+Description=Muse sleep analysis + dashboard (YASA, nightly batch, :842)
+After=network-online.target
+Wants=network-online.target
+# Analysis reads what the recorder writes, but must not require it: the dashboard
+# should be up even when the recorder is down.
+
+[Service]
+Type=simple
+User=joey
+Group=joey
+WorkingDirectory=/home/joey/muse-analysis
+
+# Native (non-container) wiring: venv interpreter + checked-out code, local
+# recordings in, results on the SD card (plenty free). Mirrors the old compose env.
+Environment=PYTHON=/home/joey/muse-analysis-env/bin/python
+Environment=APP_DIR=/home/joey/muse-analysis
+Environment=INPUT_DIR=/home/joey/recordings
+Environment=OUTPUT_DIR=/home/joey/eeg-output
+Environment=MODE=cron
+Environment=RUN_AT=09:00
+Environment=RUN_ON_START=1
+Environment=RESCAN_HOURS=1
+Environment=SERVE_WEB=1
+Environment=WEB_PORT=842
+Environment=N3_WEIGHT=3.0
+Environment=TZ=America/Los_Angeles
+Environment=MPLBACKEND=Agg
+
+ExecStart=/home/joey/muse-analysis/entrypoint.sh
+Restart=always
+RestartSec=10
+
+# Bind the privileged port 842 as a non-root user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# The RECORDER MUST ALWAYS WIN. This batch has all day, so starve it of priority,
+# cap it to 2 of the 4 cores, and throttle memory well before the OOM killer could
+# ever look at the recorder. (Recorder: Nice 0. Status page: Nice 10. This: 15.)
+Nice=15
+CPUWeight=20
+CPUQuota=200%
+IOWeight=20
+MemoryHigh=2G
+MemoryMax=2800M
+OOMScoreAdjust=800
+
+[Install]
+WantedBy=multi-user.target

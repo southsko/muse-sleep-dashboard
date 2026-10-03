@@ -65,10 +65,14 @@ def regenerate_plots() -> None:
     request like table times, so a settings change means re-running the analyzer
     with --force. Backgrounded and flock-guarded (analyze.py serializes itself),
     so a rapid series of saves can't pile up overlapping runs."""
-    import subprocess
+    import subprocess, sys
     in_dir = os.environ.get("INPUT_DIR", "/data/recordings")
+    # Use THIS interpreter (so the venv is honoured on a native Pi install, not
+    # just the container's bare `python`) and analyze.py next to this file,
+    # rather than the hardcoded /app container path.
+    analyze_py = str(Path(__file__).resolve().parent / "analyze.py")
     subprocess.Popen(
-        ["python", "/app/analyze.py", in_dir, "-o", str(OUTPUT_DIR),
+        [sys.executable, analyze_py, in_dir, "-o", str(OUTPUT_DIR),
          "--force", "--no-index"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )

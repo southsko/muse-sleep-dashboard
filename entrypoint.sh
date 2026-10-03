@@ -10,6 +10,12 @@
 
 set -euo pipefail
 
+# Interpreter + code location. Default to the container layout (bare `python`,
+# code at /app); a native install (e.g. on the Pi) overrides these to point at a
+# venv interpreter and the checked-out code directory.
+PYTHON="${PYTHON:-python}"
+APP_DIR="${APP_DIR:-/app}"
+
 INPUT_DIR="${INPUT_DIR:-/data/recordings}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/output}"
 MODE="${MODE:-cron}"
@@ -24,7 +30,7 @@ run_batch() {
   # analyze.py serializes itself with a lock (a scheduled run, a startup run and
   # a manual invocation share one .work dir and must not overlap), so we simply
   # never let one bad batch kill the container in cron/watch mode.
-  if python /app/analyze.py "${INPUT_DIR}" -o "${OUTPUT_DIR}" "$@"; then
+  if "${PYTHON}" "${APP_DIR}/analyze.py" "${INPUT_DIR}" -o "${OUTPUT_DIR}" "$@"; then
     log "batch complete"
   else
     log "batch exited nonzero (continuing)"
@@ -43,7 +49,7 @@ case "${MODE}" in
 
   web)
     log "web mode: dashboard only on :${WEB_PORT:-842}"
-    exec python /app/app.py
+    exec "${PYTHON}" "${APP_DIR}/app.py"
     ;;
 
   cron)
@@ -54,7 +60,7 @@ case "${MODE}" in
     # the foreground as PID 1's child so docker restart policies behave.
     if [[ "${SERVE_WEB:-1}" == "1" ]]; then
       log "starting dashboard on :${WEB_PORT:-842}"
-      python /app/app.py &
+      "${PYTHON}" "${APP_DIR}/app.py" &
       WEB_PID=$!
       trap 'kill "${WEB_PID}" 2>/dev/null' TERM INT
     fi
