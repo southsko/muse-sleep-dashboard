@@ -464,6 +464,13 @@ def _decode_eeg_timed(messages: list):
     shortfall piled up as a fake 80-180 s "gap" at the end of every file — on a
     link that never dropped.
 
+    Tick timing alone did NOT kill that gap (measured 2026-10-02: a full, 100%-
+    present, never-dropped hour still decoded to 58.6 min, an ~80 s hole at every
+    seam). The Athena's tick advances 1000 per EEG sample at its TRUE ~250 Hz rate,
+    but make_timestamps divides ticks by DEVICE_CLOCK_HZ=256000 (assumes 256 Hz),
+    so the whole hour is compressed ~2.3%. The real fix is the final rescale below:
+    stretch each file's tick timeline to its real arrival-time span so seams meet.
+
     Only 4-channel EEG subpackets are kept: the Athena occasionally emits a stray
     8-channel one, and mixing shapes is what made OpenMuse's decode abort (the old
     code lost a whole 200-line batch each time). Unparsable lines are skipped.
@@ -477,6 +484,7 @@ def _decode_eeg_timed(messages: list):
     subs, anchor = [], None
     prev = wrap = 0
     first = None
+    msg_hi = None                              # arrival wall-clock of the last kept packet
     for m in messages:
         try:
             parsed = parse_message(m)
@@ -506,6 +514,7 @@ def _decode_eeg_timed(messages: list):
                 stats["odd_subpackets"] += 1
                 continue
             sp["pkt_time_raw"] = rebased           # keeps make_timestamps wrap-free
+            msg_hi = sp["message_time"].timestamp()  # messages are in arrival order
             subs.append(sp)
     if not subs:
         return None, None, stats
@@ -515,7 +524,26 @@ def _decode_eeg_timed(messages: list):
     # make_timestamps is relative to the earliest tick; `first` sits at MARGIN, so
     # shift by where the earliest tick lies relative to it (0 unless out of order).
     t_first = (min(sp["pkt_time_raw"] for sp in subs) - MARGIN) / TICK_HZ
-    return anchor + t_first + arr[:, 0], arr[:, 1:5], stats
+    rel = (t_first + arr[:, 0]).astype("float64")
+    rel -= rel[0]                              # zero-base: first sample sits at `anchor`
+
+    # Rescale the tick timeline to this file's REAL elapsed time. The Athena's
+    # packet tick advances 1000 per sample at its true ~250 Hz EEG rate, but
+    # make_timestamps divides ticks by DEVICE_CLOCK_HZ=256000 (i.e. assumes exactly
+    # 256 Hz), so an hour of a perfect, never-dropped link decodes ~2.3% too short
+    # — ~58.6 min — and the missing ~80 s surfaces as a hole at EVERY file seam,
+    # because the next file is anchored to real arrival time. message_time is the
+    # wall clock each packet was received at, so (last - first) is the file's real
+    # span; scaling to it is self-calibrating against the true rate/drift and also
+    # restores correct EEG frequencies (spindles etc. were ~2.3% high). Falls back
+    # to raw tick timing if the arrival span looks implausible (e.g. a 1-packet file).
+    tick_span = float(rel[-1]) if rel.size > 1 else 0.0
+    real_span = (msg_hi - anchor) if (msg_hi is not None and anchor is not None) else 0.0
+    if tick_span > 1.0 and real_span > 1.0:
+        ratio = real_span / tick_span
+        if 0.80 <= ratio <= 1.25:              # expected ~1.023; guard against garbage
+            rel *= ratio
+    return anchor + rel, arr[:, 1:5], stats
 
 
 def decode_txt_to_csv(raw_path: Path, csv_path: Path) -> int:

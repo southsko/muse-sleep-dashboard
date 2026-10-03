@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-03
+
+### The ~80 s hole at every hourly seam — actually fixed this time
+Nights were still showing a gap at every file rotation (~80 s, every hour). The
+2026-09-25 "one connection, rotate in place" change was correct — the link never
+drops across a rotation — and so was moving to device-tick timing, but neither
+killed the hole. Root cause, proven from 2026-10-02's logs: each raw file captured a
+full **60 real minutes** and decoded to **"100% of samples present, 0 s lost"** — a
+completely full grid — yet that grid spanned only **58.6 min**. So a perfect,
+never-dropped hour was being *compressed* ~2.3%, and the missing ~80 s surfaced as a
+hole before the next file (which is anchored to real arrival time).
+
+- **Why:** the Athena's packet tick advances 1000 per EEG sample at its *true* ~250 Hz
+  rate, but OpenMuse's `make_timestamps` divides ticks by `DEVICE_CLOCK_HZ = 256000`
+  (i.e. assumes exactly 256 Hz), compressing every hour by 250/256 ≈ 2.3%.
+- **Fix (`_decode_eeg_timed`):** rescale each file's tick timeline to its real elapsed
+  arrival-time span (`message_time` of the last packet − the first). Self-calibrating
+  against the true rate/drift, so seams now butt up to within one packet interval. As a
+  bonus it also corrects EEG frequencies, which were reading ~2.3% high (spindles etc.).
+  Falls back to raw tick timing if the arrival span is implausible (e.g. a 1-packet file).
+- Verified with a synthetic 250 Hz hour through the real `make_timestamps`: buggy span
+  3515.6 s → fixed 3599.98 s (seam error 0 ms); a true-256 Hz file is left unchanged.
+- Pi backup: `~/muse_athena_record.py.pre-seamfix-20261003`.
+
 ## 2026-10-02
 
 ### Everything now runs on the Pi (Unraid retired)
